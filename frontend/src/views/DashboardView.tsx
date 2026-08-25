@@ -70,16 +70,9 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     );
   }
 
-  // Fallback default discovered accounts if user already authorized or connects
-  const defaultAccounts = [
-    { accountId: currentUser.cTraderAccountId || 'cTrader-881290', brokerName: 'FP Markets', accountType: 'LIVE' as const, currency: 'USD', balance: 25480, leverage: 500, isLive: true },
-    { accountId: 'cTrader-339102', brokerName: 'FP Markets', accountType: 'DEMO' as const, currency: 'USD', balance: 50000, leverage: 200, isLive: false },
-    { accountId: 'cTrader-190442', brokerName: 'Spotware Open API', accountType: 'DEMO' as const, currency: 'USD', balance: 10000, leverage: 100, isLive: false }
-  ];
-
   const currentAccounts = (currentUser.cTraderAccounts && currentUser.cTraderAccounts.length > 0)
     ? currentUser.cTraderAccounts
-    : defaultAccounts;
+    : [];
 
   const activeAccount = currentAccounts.find((a) => a.accountId === currentUser.cTraderAccountId) || currentAccounts[0];
 
@@ -126,7 +119,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   // Compute live performance metrics
   const totalTradesCount = liveTrades.length + closedTrades.length;
   const winningTrades = closedTrades.filter((t) => (t.profitUSD ?? 0) > 0);
-  const winRate = closedTrades.length > 0 ? (((winningTrades.length / closedTrades.length) * 100) || 0).toFixed(1) : '78.5';
+  const winRate = closedTrades.length > 0 ? (((winningTrades.length / closedTrades.length) * 100) || 0).toFixed(1) : (currentUser.cTraderConnected && currentUser.winRate ? currentUser.winRate.toFixed(1) : '0.0');
   const closedProfitUSD = closedTrades.reduce((acc, t) => acc + (t.profitUSD ?? 0), 0);
   const liveProfitUSD = liveTrades.reduce((acc, t) => acc + (t.profitUSD ?? 0), 0);
   const netProfitUSD = +((closedProfitUSD + liveProfitUSD) || 0).toFixed(2);
@@ -290,66 +283,70 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               <div className="flex items-center justify-between">
                 <div>
                   <div className="flex items-center gap-1.5">
-                    <span className="font-bold text-white text-xs">{activeAccount?.brokerName || 'FP Markets'}</span>
+                    <span className="font-bold text-white text-xs">
+                      {currentUser.cTraderConnected ? (activeAccount?.brokerName || 'Spotware cTrader') : 'Spotware cTrader'}
+                    </span>
                     <span className={`px-1.5 py-0.5 rounded text-[8px] font-black ${
                       (activeAccount?.accountType || 'LIVE') === 'LIVE'
                         ? 'bg-emerald-500 text-black'
                         : 'bg-amber-500 text-black'
                     }`}>
-                      {activeAccount?.accountType || 'LIVE'}
+                      {currentUser.cTraderConnected ? (activeAccount?.accountType || 'LIVE') : 'OFFLINE'}
                     </span>
                   </div>
                   <span className="text-[11px] text-emerald-300 font-mono block">
-                    ID: {currentUser.cTraderAccountId || activeAccount?.accountId || 'cTrader-881290'}
+                    ID: {currentUser.cTraderConnected ? (currentUser.cTraderAccountId || activeAccount?.accountId || 'Belum Terhubung') : 'Belum Terhubung'}
                   </span>
                 </div>
 
                 <div className="text-right font-mono">
                   <span className="text-xs font-black text-white block">
-                    ${(activeAccount?.balance || 25480).toLocaleString()} USD
+                    {currentUser.cTraderConnected ? `$${(activeAccount?.balance || 0).toLocaleString()} USD` : '$0 USD'}
                   </span>
                   <span className="text-[9px] text-neutral-400">
-                    Leverage 1:{activeAccount?.leverage || 500}
+                    {currentUser.cTraderConnected ? `Leverage 1:${activeAccount?.leverage || 500}` : 'Status: Belum Terhubung'}
                   </span>
                 </div>
               </div>
 
               {/* Account Switcher Pills */}
-              <div className="pt-2 border-t border-emerald-500/20">
-                <span className="text-[10px] text-neutral-400 font-semibold mb-1.5 block flex items-center justify-between">
-                  <span>Pilih / Beralih Akun Aktif:</span>
-                  {isSwitching && <span className="text-amber-300 text-[9px] animate-pulse">Menghubungkan...</span>}
-                </span>
+              {currentAccounts.length > 0 && (
+                <div className="pt-2 border-t border-emerald-500/20">
+                  <span className="text-[10px] text-neutral-400 font-semibold mb-1.5 block flex items-center justify-between">
+                    <span>Pilih / Beralih Akun Aktif:</span>
+                    {isSwitching && <span className="text-amber-300 text-[9px] animate-pulse">Menghubungkan...</span>}
+                  </span>
 
-                <div className="grid grid-cols-3 gap-1.5">
-                  {currentAccounts.map((acc) => {
-                    const isSelected = acc.accountId === currentUser.cTraderAccountId;
-                    return (
-                      <button
-                        key={acc.accountId}
-                        onClick={() => handleQuickSwitch(acc)}
-                        disabled={isSwitching}
-                        className={`p-1.5 rounded-lg text-left transition-all border cursor-pointer ${
-                          isSelected
-                            ? 'bg-emerald-500/30 border-emerald-400 text-white shadow-sm'
-                            : 'bg-[#091d12] hover:bg-[#113320] border-emerald-500/20 text-neutral-300'
-                        }`}
-                      >
-                        <div className="flex items-center justify-between">
-                          <span className="text-[9px] font-bold truncate block">{acc.accountType}</span>
-                          {isSelected && <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />}
-                        </div>
-                        <span className="text-[9px] font-mono text-neutral-400 block truncate">
-                          #{acc.accountId ? acc.accountId.slice(-6) : 'ACC'}
-                        </span>
-                        <span className="text-[9px] font-mono font-bold text-emerald-300 block">
-                          ${(acc.balance || 0).toLocaleString()}
-                        </span>
-                      </button>
-                    );
-                  })}
+                  <div className="grid grid-cols-3 gap-1.5">
+                    {currentAccounts.map((acc) => {
+                      const isSelected = acc.accountId === currentUser.cTraderAccountId;
+                      return (
+                        <button
+                          key={acc.accountId}
+                          onClick={() => handleQuickSwitch(acc)}
+                          disabled={isSwitching}
+                          className={`p-1.5 rounded-lg text-left transition-all border cursor-pointer ${
+                            isSelected
+                              ? 'bg-emerald-500/30 border-emerald-400 text-white shadow-sm'
+                              : 'bg-[#091d12] hover:bg-[#113320] border-emerald-500/20 text-neutral-300'
+                          }`}
+                        >
+                          <div className="flex items-center justify-between">
+                            <span className="text-[9px] font-bold truncate block">{acc.accountType}</span>
+                            {isSelected && <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />}
+                          </div>
+                          <span className="text-[9px] font-mono text-neutral-400 block truncate">
+                            #{acc.accountId ? acc.accountId.slice(-6) : 'ACC'}
+                          </span>
+                          <span className="text-[9px] font-mono font-bold text-emerald-300 block">
+                            ${(acc.balance || 0).toLocaleString()}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
                 </div>
-              </div>
+              )}
             </div>
 
             {/* Action Buttons: Switch/Manage Gateway & New Account */}

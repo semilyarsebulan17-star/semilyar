@@ -32,12 +32,11 @@ interface EnergyModalProps {
   onOpenKycModal?: () => void;
 }
 
-// Helper to sanitize any Mayar URLs to strictly point to scrolic.myr.id
 const cleanMayarUrl = (url?: string | null): string => {
   if (!url || typeof url !== 'string' || url.trim() === '') {
-    return 'https://scrolic.myr.id';
+    return '';
   }
-  return url.replace(/renko\.myr\.id/gi, 'scrolic.myr.id').trim();
+  return url.trim();
 };
 
 export const EnergyModal: React.FC<EnergyModalProps> = ({
@@ -179,7 +178,12 @@ export const EnergyModal: React.FC<EnergyModalProps> = ({
     onTopupSuccess(balance);
 
     // Refresh transaction list
-    fetch('/api/payment/transactions')
+    fetch('/api/payment/transactions', {
+      headers: {
+        'Content-Type': 'application/json',
+        'x-session-user-id': currentUser.id || currentUser.username || ''
+      }
+    })
       .then((res) => res.json())
       .then((data) => {
         if (data.transactions) setTransactions(data.transactions);
@@ -194,11 +198,15 @@ export const EnergyModal: React.FC<EnergyModalProps> = ({
     try {
       const response = await fetch('/api/payments/mayar/create', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'x-session-user-id': currentUser.id || currentUser.username || ''
+        },
         body: JSON.stringify({ 
+          userId: currentUser.id || currentUser.username,
           amountEnergy: selectedPackage,
           method: 'portal',
-          customerName: currentUser.name || currentUser.username,
+          customerName: currentUser.displayName || currentUser.name || currentUser.username,
           customerEmail: currentUser.email || `${currentUser.username}@scrolic.com`
         })
       });
@@ -456,10 +464,10 @@ export const EnergyModal: React.FC<EnergyModalProps> = ({
                   target="_blank"
                   rel="noopener noreferrer"
                   onClick={() => triggerHaptic('medium')}
-                  className="w-full py-2.5 rounded-xl bg-[#141414] hover:bg-[#1a1a1a] border border-emerald-500/30 text-emerald-300 font-semibold text-[11px] flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
+                  className="w-full py-3 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-black font-extrabold text-xs flex items-center justify-center gap-2 transition-all shadow-lg shadow-emerald-500/20 cursor-pointer"
                 >
-                  <ExternalLink className="w-3.5 h-3.5 text-emerald-400" />
-                  <span>Buka Portal Mayar di Tab Baru (https://scrolic.myr.id)</span>
+                  <ExternalLink className="w-4 h-4 stroke-[2.5]" />
+                  <span>Buka Halaman Pembayaran Mayar.id (QRIS / VA)</span>
                 </a>
 
                 {/* Real-time sync hint */}

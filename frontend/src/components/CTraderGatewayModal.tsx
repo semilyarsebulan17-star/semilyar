@@ -39,16 +39,9 @@ export const CTraderGatewayModal: React.FC<CTraderGatewayModalProps> = ({
 }) => {
   const isConnected = Boolean(currentUser.cTraderConnected);
 
-  // Fallback default discovered accounts if user already authorized or connects
-  const defaultAccounts = [
-    { accountId: currentUser.cTraderAccountId || 'cTrader-881290', brokerName: 'FP Markets', accountType: 'LIVE' as const, currency: 'USD', balance: 25480, leverage: 500, isLive: true },
-    { accountId: 'cTrader-339102', brokerName: 'FP Markets', accountType: 'DEMO' as const, currency: 'USD', balance: 50000, leverage: 200, isLive: false },
-    { accountId: 'cTrader-190442', brokerName: 'Spotware Open API', accountType: 'DEMO' as const, currency: 'USD', balance: 10000, leverage: 100, isLive: false }
-  ];
-
   const currentAccounts = (currentUser.cTraderAccounts && currentUser.cTraderAccounts.length > 0)
     ? currentUser.cTraderAccounts
-    : defaultAccounts;
+    : [];
 
   // States
   const [config, setConfig] = useState<{ clientId?: string; grantAccessUrl?: string; isConfigured?: boolean }>({});
@@ -478,7 +471,7 @@ export const CTraderGatewayModal: React.FC<CTraderGatewayModalProps> = ({
                 <div className="bg-[#0a140f] p-3 rounded-xl border border-emerald-500/20 flex items-center justify-between text-xs">
                   <div>
                     <span className="text-white font-mono font-black text-sm block">
-                      {currentUser.cTraderAccountId || 'cTrader-881290'}
+                      {currentUser.cTraderAccountId || 'Akun Tidak Ditemukan'}
                     </span>
                     <span className="text-emerald-300/80 text-[11px]">
                       FP Markets cTrader • Auto-Sync Feed Aktif
