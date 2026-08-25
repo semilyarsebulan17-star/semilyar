@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Optional
 
 import httpx
+import shutil
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.responses import JSONResponse
@@ -50,11 +51,32 @@ def _start_node_backend() -> None:
     env["DISABLE_HMR"] = "true"
     env["SCROLIC_LLM_BASE"] = "http://127.0.0.1:8001"
     logger.info(f"[node] spawning on port {NODE_PORT}")
-    _node_proc = subprocess.Popen(
+    cmd_candidates = [
         ["/usr/bin/npx", "tsx", "server.ts"],
-        cwd=str(node_dir), env=env, stdout=sys.stdout, stderr=sys.stderr, preexec_fn=os.setsid,
-    )
-    logger.info(f"[node] pid={_node_proc.pid}")
+        ["npx", "tsx", "server.ts"],
+        [str(node_dir / "node_modules" / ".bin" / "tsx"), "server.ts"],
+    ]
+    for cmd in cmd_candidates:
+        try:
+            executable = cmd[0]
+            if os.path.isabs(executable):
+                if not Path(executable).exists():
+                    continue
+            else:
+                if shutil.which(executable) is None and not Path(executable).exists():
+                    continue
+
+            _node_proc = subprocess.Popen(
+                cmd,
+                cwd=str(node_dir), env=env, stdout=sys.stdout, stderr=sys.stderr, preexec_fn=os.setsid,
+            )
+            logger.info(f"[node] pid={_node_proc.pid} (cmd={cmd[0]})")
+            return
+        except FileNotFoundError:
+            continue
+        except Exception as e:
+            logger.warning(f"[node] failed to start with {cmd}: {e}")
+    logger.error("[node] could not start: no suitable 'tsx' runner found (npx/tsx missing). Node backend will remain offline.")
 
 
 def _stop_node_backend() -> None:
