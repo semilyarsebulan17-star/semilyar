@@ -71,7 +71,7 @@ export class CTraderService {
    * Spec: https://openapi.ctrader.com/apps/auth or https://id.ctrader.com/my/settings/openapi/grantingaccess/
    */
   public getAuthUrl(customRedirectUri?: string, state?: string): string {
-    const redirectUri = customRedirectUri || process.env.CTRADER_REDIRECT_URI || 'https://scrolic.id/api/ctrader/oauth/callback';
+    const redirectUri = customRedirectUri || process.env.CTRADER_REDIRECT_URI || '';
     const stateParam = state ? `&state=${encodeURIComponent(state)}` : '';
     
     // Official Spotware cTrader Open API grant access URL

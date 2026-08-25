@@ -29,7 +29,8 @@ interface CTraderGatewayModalProps {
 }
 
 export const FP_MARKETS_REGISTER_URL = 'https://portal.fp-indonesia.com/register?fpm-affiliate-utm-source=IB&fpm-affiliate-agt=61546';
-export const CTRADER_GRANT_ACCESS_URL = 'https://id.ctrader.com/my/settings/openapi/grantingaccess/?client_id=30703_aZOl6bkhkOS6I6okMoXYI8v5XJxCumiXbIa5yj91YqcpOiRTMF&redirect_uri=https%3A%2F%2Fscrolic.id%2Fapi%2Fctrader%2Fcallback&scope=trading&product=web';
+// The full Grant Access URL is built dynamically by the backend `/api/ctrader/config` endpoint
+// using the current APP_URL, so no hardcoded domain here.
 
 export const CTraderGatewayModal: React.FC<CTraderGatewayModalProps> = ({
   currentUser,

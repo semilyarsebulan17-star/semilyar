@@ -14,7 +14,7 @@ import httpx
 import shutil
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from starlette.middleware.cors import CORSMiddleware
 from starlette.websockets import WebSocketState
@@ -39,31 +39,80 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, 
 _node_proc: Optional[subprocess.Popen] = None
 
 
+def _kill_existing_on_port(port: int) -> None:
+    """Kill any process holding target port (leftover from previous reload)."""
+    try:
+        out = subprocess.check_output(["/usr/bin/lsof", "-ti", f"tcp:{port}"], stderr=subprocess.DEVNULL, timeout=3).decode().strip()
+        for pid_str in out.split("\n"):
+            if pid_str.strip().isdigit():
+                try:
+                    os.kill(int(pid_str), signal.SIGKILL)
+                    logger.info(f"[node] killed leftover pid={pid_str} on :{port}")
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def _ensure_node_modules(node_dir: Path) -> None:
+    """Install Node deps if node_modules is missing (deployment doesn't ship node_modules)."""
+    nm = node_dir / "node_modules"
+    tsx_bin = nm / ".bin" / "tsx"
+    if tsx_bin.exists():
+        return
+    logger.info(f"[node] node_modules missing at {nm}, running yarn install (this may take ~60s)...")
+    yarn_bin = shutil.which("yarn") or "/usr/bin/yarn"
+    npm_bin = shutil.which("npm") or "/usr/bin/npm"
+    installer = None
+    if Path(yarn_bin).exists() or shutil.which("yarn"):
+        installer = [yarn_bin, "install", "--production=false", "--non-interactive"]
+    elif Path(npm_bin).exists() or shutil.which("npm"):
+        installer = [npm_bin, "install", "--no-audit", "--no-fund"]
+    if not installer:
+        logger.error("[node] neither yarn nor npm found - cannot install Node deps")
+        return
+    try:
+        result = subprocess.run(installer, cwd=str(node_dir), timeout=300,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        logger.info(f"[node] deps install exit={result.returncode}")
+        if result.returncode != 0:
+            logger.error(f"[node] install output tail: {result.stdout.decode(errors='ignore')[-2000:]}")
+    except Exception as e:
+        logger.error(f"[node] install failed: {e}")
+
+
 def _start_node_backend() -> None:
     global _node_proc
     node_dir = Path("/app/node_server")
     if not node_dir.exists():
-        logger.warning("[node] /app/node_server missing")
+        logger.error("[node] /app/node_server missing - Node backend cannot start")
         return
+    _kill_existing_on_port(NODE_PORT)
+    _ensure_node_modules(node_dir)
     env = os.environ.copy()
     env["PORT"] = str(NODE_PORT)
     env["NODE_ENV"] = "production"
     env["DISABLE_HMR"] = "true"
     env["SCROLIC_LLM_BASE"] = "http://127.0.0.1:8001"
-    logger.info(f"[node] spawning on port {NODE_PORT}")
-    cmd_candidates = [
+    logger.info(f"[node] spawning on port {NODE_PORT} (cwd={node_dir})")
+    local_tsx = node_dir / "node_modules" / ".bin" / "tsx"
+    cmd_candidates = []
+    if local_tsx.exists():
+        cmd_candidates.append([str(local_tsx), "server.ts"])
+    cmd_candidates.extend([
         ["/usr/bin/npx", "tsx", "server.ts"],
         ["npx", "tsx", "server.ts"],
-        [str(node_dir / "node_modules" / ".bin" / "tsx"), "server.ts"],
-    ]
+    ])
     for cmd in cmd_candidates:
         try:
             executable = cmd[0]
             if os.path.isabs(executable):
                 if not Path(executable).exists():
+                    logger.info(f"[node] skip {executable} (not found)")
                     continue
             else:
-                if shutil.which(executable) is None and not Path(executable).exists():
+                if shutil.which(executable) is None:
+                    logger.info(f"[node] skip {executable} (not on PATH)")
                     continue
 
             _node_proc = subprocess.Popen(
@@ -73,10 +122,11 @@ def _start_node_backend() -> None:
             logger.info(f"[node] pid={_node_proc.pid} (cmd={cmd[0]})")
             return
         except FileNotFoundError:
+            logger.info(f"[node] FileNotFoundError for {cmd}")
             continue
         except Exception as e:
             logger.warning(f"[node] failed to start with {cmd}: {e}")
-    logger.error("[node] could not start: no suitable 'tsx' runner found (npx/tsx missing). Node backend will remain offline.")
+    logger.error("[node] could not start: no suitable 'tsx' runner found. Node backend will remain offline.")
 
 
 def _stop_node_backend() -> None:
@@ -93,7 +143,22 @@ def _stop_node_backend() -> None:
 @app.on_event("startup")
 async def on_startup():
     _start_node_backend()
-    await asyncio.sleep(0.5)
+    # Wait up to ~20s for Node to bind port 3001 (fast when already installed, longer on cold deploy)
+    for i in range(40):
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(NODE_HOST, NODE_PORT), timeout=0.4
+            )
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+            logger.info(f"[node] port {NODE_PORT} is up (after {i * 0.5:.1f}s)")
+            return
+        except Exception:
+            await asyncio.sleep(0.5)
+    logger.warning(f"[node] port {NODE_PORT} did not open in 20s - proxy will return 503 until it comes up")
 
 
 @app.on_event("shutdown")
@@ -209,7 +274,18 @@ async def llm_kyc_ktp(req: KycKtpReq):
 
 @app.get("/api/health/proxy")
 async def health_proxy():
-    return {"ok": True, "service": "scrolic-hybrid-proxy", "node_pid": _node_proc.pid if _node_proc else None}
+    node_alive = False
+    if _node_proc is not None:
+        node_alive = _node_proc.poll() is None
+    return {
+        "ok": True,
+        "service": "scrolic-hybrid-proxy",
+        "node_pid": _node_proc.pid if _node_proc else None,
+        "node_alive": node_alive,
+        "node_port": NODE_PORT,
+        "gemini_model": GEMINI_MODEL,
+        "llm_configured": bool(EMERGENT_LLM_KEY),
+    }
 
 
 # ---------------- HTTP Proxy ----------------
@@ -219,7 +295,8 @@ _http_client: Optional[httpx.AsyncClient] = None
 def _get_http_client() -> httpx.AsyncClient:
     global _http_client
     if _http_client is None:
-        _http_client = httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=5.0))
+        # No read timeout for streaming (SSE); short connect timeout
+        _http_client = httpx.AsyncClient(timeout=httpx.Timeout(None, connect=5.0))
     return _http_client
 
 
@@ -236,14 +313,43 @@ async def _proxy_http(request: Request, path: str) -> Response:
     fwd["x-forwarded-proto"] = request.url.scheme
     fwd.setdefault("x-forwarded-host", request.headers.get("host", ""))
     body = await request.body()
+
+    client = _get_http_client()
     try:
-        resp = await _get_http_client().request(request.method, url, headers=fwd, content=body, follow_redirects=False)
+        # Use streaming so long-lived SSE / event-stream endpoints don't block the worker
+        req = client.build_request(request.method, url, headers=fwd, content=body)
+        upstream = await client.send(req, stream=True, follow_redirects=False)
     except httpx.ConnectError:
         return JSONResponse({"error": {"code": "NODE_DOWN", "message": "Node backend unreachable"}}, status_code=503)
     except Exception as e:
         return JSONResponse({"error": {"code": "PROXY_ERROR", "message": str(e)}}, status_code=502)
-    out = {k: v for k, v in resp.headers.items() if k.lower() not in HOP_HEADERS}
-    return Response(content=resp.content, status_code=resp.status_code, headers=out)
+
+    out_headers = {k: v for k, v in upstream.headers.items() if k.lower() not in HOP_HEADERS}
+    content_type = upstream.headers.get("content-type", "")
+
+    # Small JSON/text responses → read fully, close upstream, return simple Response
+    is_stream = ("text/event-stream" in content_type) or ("stream" in content_type.lower())
+    if not is_stream:
+        try:
+            data = await upstream.aread()
+        finally:
+            await upstream.aclose()
+        return Response(content=data, status_code=upstream.status_code, headers=out_headers, media_type=content_type or None)
+
+    # Streaming path (SSE, chunked)
+    async def stream_body():
+        try:
+            async for chunk in upstream.aiter_raw():
+                yield chunk
+        except Exception:
+            pass
+        finally:
+            await upstream.aclose()
+
+    # SSE-friendly headers: disable proxy buffering
+    out_headers.setdefault("cache-control", "no-cache")
+    out_headers["x-accel-buffering"] = "no"
+    return StreamingResponse(stream_body(), status_code=upstream.status_code, headers=out_headers, media_type=content_type)
 
 
 @app.api_route("/api/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])

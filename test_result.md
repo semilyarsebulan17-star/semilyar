@@ -110,9 +110,9 @@ backend:
     implemented: true
     working: true
     file: "/app/backend/server.py"
-    stuck_count: 0
+    stuck_count: 1
     priority: "high"
-    needs_retesting: false
+    needs_retesting: true
     status_history:
       - working: true
         agent: "main"
@@ -120,6 +120,12 @@ backend:
       - working: true
         agent: "testing"
         comment: "✅ VERIFIED - All proxy tests passed. GET /api/health/proxy returns {ok: true, service: 'scrolic-hybrid-proxy', node_pid: 449}. HTTP proxy correctly forwards all Node endpoints: /api/health (status ok, database connected), /api/feed (4 posts), /api/users (4 seeded users), /api/strategies (4 strategies), /api/news/economic-calendar (200 OK), /api/user/me (null user without session). Socket.IO connections working (observed in logs). 9/9 tests passed."
+      - working: false
+        agent: "user"
+        comment: "USER REPORT: Deployed URL (ai-config-tool-4.emergent.host) returns 503 NODE_DOWN. Console shows all /api/* endpoints failing with 503. Root cause found: (a) SSE endpoint /api/notifications/stream was blocking the buffered httpx proxy indefinitely, causing worker hang and eventual failure; (b) uvicorn --reload couldn't complete graceful shutdown due to open SSE streams; (c) In deployment, /app/node_server/node_modules is absent because .gitignore blocks it - so tsx runner not found."
+      - working: true
+        agent: "main"
+        comment: "FIXES: (1) Switched HTTP proxy from buffered client.request() to streaming client.send(stream=True); text/event-stream returns StreamingResponse so SSE no longer blocks ASGI. (2) Removed 60s read timeout on httpx (now None) so SSE streams stay open. (3) Added _kill_existing_on_port(3001) before spawn to clear zombies after uvicorn reload. (4) Added _ensure_node_modules() that runs yarn install on cold deploy when node_modules missing. (5) Prefer local ./node_modules/.bin/tsx before npx fallback. (6) Startup waits up to 20s for Node port to bind before returning. (7) /api/health/proxy now reports node_alive, gemini_model, llm_configured. (8) Removed .env/.env.* pattern from .gitignore so backend/.env with API keys ships with deployment. (9) Removed hardcoded scrolic.id URL from ctraderService fallback and CTraderGatewayModal (was unused constant). Locally verified: node_alive=true, /api/feed OK, SSE streams no longer block concurrent requests."
 
   - task: "Emergent LLM bridge (Gemini via emergentintegrations)"
     implemented: true
@@ -171,7 +177,10 @@ metadata:
   run_ui: false
 
 test_plan:
-  current_focus: []
+  current_focus:
+    - "Retest FastAPI hybrid proxy after SSE-streaming fix (must not block on /api/notifications/stream)"
+    - "Verify /api/feed and other endpoints still work while a long-lived /api/notifications/stream connection is active"
+    - "Verify /api/health/proxy returns node_alive=true"
   stuck_tasks: []
   test_all: false
   test_priority: "high_first"
@@ -198,5 +207,20 @@ agent_communication:
       - LLM bridge endpoints handled natively by FastAPI using Emergent LLM (gemini-3-flash-preview)
       - Socket.IO connections working (observed in backend logs)
       - MongoDB connected with seeded data (4 users, 4 posts, 4 strategies)
+  - agent: "main"
+    message: |
+      BUG FIX ROUND 2 - Deployed URL returned 503 NODE_DOWN. Root causes: (1) SSE endpoint /api/notifications/stream held HTTP connections open forever which blocked the buffered httpx proxy and eventually the ASGI worker; (2) uvicorn --reload couldn't complete graceful shutdown due to open SSE streams, causing subsequent requests to time out; (3) In deployment .gitignore was blocking /app/node_server/node_modules AND .env files.
+      
+      Fixes applied:
+      - HTTP proxy now uses httpx client.send(..., stream=True) + StreamingResponse for text/event-stream (SSE no longer blocks)
+      - httpx read timeout set to None (was 60s) for long-lived streams
+      - Auto-installer for /app/node_server/node_modules on cold deploy
+      - Kill leftover process on port 3001 before respawn (uvicorn reload cycle)
+      - Preferred local ./node_modules/.bin/tsx over global npx
+      - Startup waits up to 20s for Node port to bind
+      - Removed .env pattern from .gitignore so backend/.env ships with deployment
+      - Removed hardcoded scrolic.id fallback URL in ctraderService.ts and CTraderGatewayModal.tsx
+      
+      Please retest the SAME endpoints previously verified (health/proxy, health, feed, users, strategies, news, user/me, _llm/trade-analysis, _llm/economic-event) AND specifically test that opening a long-lived SSE connection to /api/notifications/stream does NOT prevent other /api/feed and /api/health requests from working concurrently.
       
       All backend tasks marked as working=true, needs_retesting=false. Backend is production-ready.
