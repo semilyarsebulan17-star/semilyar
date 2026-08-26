@@ -45,6 +45,7 @@ interface ProfileViewProps {
   onOpenWithdrawalModal?: () => void;
   onOpenKycModal?: () => void;
   onUpdateUser?: (updatedUser: User) => void;
+  onCloseTrade?: (tradeId: string) => void;
 }
 
 export const ProfileView: React.FC<ProfileViewProps> = ({
@@ -69,7 +70,8 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
   onOpenPromotionPage,
   onOpenWithdrawalModal,
   onOpenKycModal,
-  onUpdateUser
+  onUpdateUser,
+  onCloseTrade
 }) => {
   const [profileTab, setProfileTab] = useState<'posts' | 'live' | 'portfolio'>('posts');
   const [isEditAvatarOpen, setIsEditAvatarOpen] = useState(false);
@@ -78,9 +80,9 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
 
   // User strategy
   const userStrategy = getStrategy(user.primaryStrategyId || user.strategyDNA);
-  const userPosts = posts.filter((p) => p.userId === user.id);
-  const userLiveTrades = liveTrades.filter((t) => t.userId === user.id);
-  const userClosedTrades = closedTrades.filter((t) => t.userId === user.id);
+  const userPosts = posts.filter((p) => p.userId === user.id || p.username === user.username || (p as any).user_id === user.id);
+  const userLiveTrades = liveTrades.filter((t) => t.userId === user.id || (t as any).user_id === user.id || userPosts.some((p) => p.trade?.id === t.id && p.trade?.status === 'OPEN'));
+  const userClosedTrades = closedTrades.filter((t) => t.userId === user.id || (t as any).user_id === user.id || userPosts.some((p) => p.trade?.id === t.id && p.trade?.status === 'CLOSED'));
 
   return (
     <div className="w-full max-w-md mx-auto pb-24 px-3 sm:px-0">
@@ -373,20 +375,35 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
             userPosts
               .filter((p) => p.trade.status === 'OPEN')
               .map((post) => (
-                <DynamicFeedTemplate
-                  key={post.id}
-                  post={post}
-                  currentUser={currentUser}
-                  onUnlock={onUnlockPost}
-                  onOpenDetail={onOpenDetail}
-                  onOpenFollowSetup={onOpenFollowSetup}
-                  onOpenAskAI={onOpenAskAI}
-                  onOpenComments={onOpenComments}
-                  onToggleLike={onToggleLike}
-                  onToggleSave={onToggleSave}
-                  onToggleFollow={onToggleFollow}
-                  onEditDescription={onEditDescription}
-                />
+                <div key={post.id} className="relative">
+                  <DynamicFeedTemplate
+                    post={post}
+                    currentUser={currentUser}
+                    onUnlock={onUnlockPost}
+                    onOpenDetail={onOpenDetail}
+                    onOpenFollowSetup={onOpenFollowSetup}
+                    onOpenAskAI={onOpenAskAI}
+                    onOpenComments={onOpenComments}
+                    onToggleLike={onToggleLike}
+                    onToggleSave={onToggleSave}
+                    onToggleFollow={onToggleFollow}
+                    onEditDescription={onEditDescription}
+                  />
+                  {isMe && onCloseTrade && (
+                    <div className="mt-1 flex justify-end">
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onCloseTrade(post.trade.id || post.id);
+                        }}
+                        className="px-3 py-1.5 rounded-xl bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 border border-rose-500/40 text-xs font-bold transition-all cursor-pointer flex items-center gap-1 shadow-sm"
+                      >
+                        <span>Tutup Posisi (Close Trade)</span>
+                      </button>
+                    </div>
+                  )}
+                </div>
               ))
           )}
         </div>

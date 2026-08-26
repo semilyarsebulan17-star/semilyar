@@ -46,7 +46,7 @@ export const CTraderGatewayModal: React.FC<CTraderGatewayModalProps> = ({
   // States
   const [config, setConfig] = useState<{ clientId?: string; grantAccessUrl?: string; isConfigured?: boolean }>({});
   const [connectError, setConnectError] = useState<string | null>(null);
-  const [isSwitchingAccount, setIsSwitchingAccount] = useState(false);
+  const [isSwitchingAccount, setIsSwitchingAccount] = useState(isConnected);
   const [selectedAccountId, setSelectedAccountId] = useState<string>(currentUser.cTraderAccountId || currentAccounts[0]?.accountId || '');
   const [tokenStatus, setTokenStatus] = useState<{
     isConnected: boolean;
@@ -83,6 +83,7 @@ export const CTraderGatewayModal: React.FC<CTraderGatewayModalProps> = ({
       if (e.data?.type === 'CTRADER_OAUTH_SUCCESS') {
         if (e.data.user) {
           onUpdateUser(e.data.user);
+          setIsSwitchingAccount(true);
         } else if (e.data.accounts && e.data.accounts.length > 0) {
           handleFinalizeConnection(e.data.accounts[0]?.accountId);
         }
@@ -94,6 +95,8 @@ export const CTraderGatewayModal: React.FC<CTraderGatewayModalProps> = ({
     window.addEventListener('message', handleMessage);
     return () => window.removeEventListener('message', handleMessage);
   }, [isConnected]);
+
+  const [isSyncingTrades, setIsSyncingTrades] = useState(false);
 
   const handleManualRefreshToken = async () => {
     setIsRefreshingToken(true);
@@ -112,6 +115,23 @@ export const CTraderGatewayModal: React.FC<CTraderGatewayModalProps> = ({
     }
   };
 
+  const handleSyncAccountTrades = async () => {
+    setIsSyncingTrades(true);
+    triggerHaptic('medium');
+    try {
+      const res = await fetch('/api/ctrader/sync', { method: 'POST' });
+      const data = await res.json();
+      if (data.success && data.user) {
+        onUpdateUser(data.user);
+        triggerHaptic('success');
+      }
+    } catch {
+      triggerHaptic('error');
+    } finally {
+      setIsSyncingTrades(false);
+    }
+  };
+
   // Step state for Connect Flow after granting access
   const [hasGrantedAccessPrompt, setHasGrantedAccessPrompt] = useState(false);
   const [isConnectingAuthorizedAccount, setIsConnectingAuthorizedAccount] = useState(false);
@@ -126,12 +146,24 @@ export const CTraderGatewayModal: React.FC<CTraderGatewayModalProps> = ({
   const [isConfirmingDisconnect, setIsConfirmingDisconnect] = useState(false);
   const [isDisconnecting, setIsDisconnecting] = useState(false);
 
-  // 1. User clicks "Hubungkan Sekarang" -> open cTrader official grant access page
-  const handleOpenGrantAccess = () => {
+  // 1. User clicks "Hubungkan Sekarang" -> open cTrader official grant access popup
+  const handleOpenGrantAccess = async () => {
     triggerHaptic('selection');
-    const authUrl = config.grantAccessUrl || `/api/ctrader/auth-url?userId=${encodeURIComponent(currentUser.id || currentUser.username)}`;
-    window.open(authUrl, '_blank', 'noopener,noreferrer,width=600,height=750');
     setHasGrantedAccessPrompt(true);
+    try {
+      const uId = encodeURIComponent(currentUser.id || currentUser.username || '');
+      const res = await fetch(`/api/ctrader/auth-url?json=true&userId=${uId}`);
+      const data = await res.json();
+      const targetUrl = data.authUrl || data.url || config.grantAccessUrl;
+      if (targetUrl) {
+        window.open(targetUrl, 'cTraderOAuthPopup', 'width=600,height=750,scrollbars=yes,status=yes');
+      } else {
+        window.open(`/api/ctrader/auth-url?userId=${uId}`, 'cTraderOAuthPopup', 'width=600,height=750,scrollbars=yes,status=yes');
+      }
+    } catch {
+      const fallbackUrl = config.grantAccessUrl || `/api/ctrader/auth-url?userId=${encodeURIComponent(currentUser.id || currentUser.username)}`;
+      window.open(fallbackUrl, 'cTraderOAuthPopup', 'width=600,height=750,scrollbars=yes,status=yes');
+    }
   };
 
   // 2. User confirms they gave access or selects account to bind
@@ -348,7 +380,7 @@ export const CTraderGatewayModal: React.FC<CTraderGatewayModalProps> = ({
                     <ShieldCheck className="w-4 h-4 text-amber-400" />
                     <span>Otorisasi Resmi Spotware cTrader</span>
                   </h4>
-                  <span className="text-[10px] text-emerald-400 font-mono">Open API 2.0</span>
+                  <span className="text-[10px] text-emerald-400 font-mono">Bebas Blokir (Cloudflare ECN Proxy) • Open API 2.0</span>
                 </div>
 
                 <p className="text-xs text-neutral-300 leading-relaxed">
@@ -384,7 +416,7 @@ export const CTraderGatewayModal: React.FC<CTraderGatewayModalProps> = ({
                       <Sparkles className="w-4 h-4 text-amber-400" />
                       <h4 className="text-xs font-bold text-white">Pilih Akun yang Ingin Dihubungkan</h4>
                     </div>
-                    <span className="text-[10px] text-amber-300 font-mono">3 Akun Terdeteksi</span>
+                    <span className="text-[10px] text-amber-300 font-mono">{currentAccounts.length} Akun Terdeteksi</span>
                   </div>
 
                   <p className="text-[11px] text-neutral-300 leading-relaxed">
@@ -419,7 +451,7 @@ export const CTraderGatewayModal: React.FC<CTraderGatewayModalProps> = ({
                                   {acc.accountType}
                                 </span>
                               </div>
-                              <span className="text-[10px] text-neutral-400">{acc.brokerName} • Balance: ${(acc.balance || 0).toLocaleString()}</span>
+                              <span className="text-[10px] text-neutral-400">{acc.brokerName} • Balance: ${((acc.balance ?? 0) > 2000 ? ((acc.balance ?? 0) / 100.0) : (acc.balance ?? 0)).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
                             </div>
                           </div>
 
@@ -508,6 +540,16 @@ export const CTraderGatewayModal: React.FC<CTraderGatewayModalProps> = ({
                       <span>{isRefreshingToken ? 'Memperbarui...' : 'Refresh Token'}</span>
                     </button>
                   </div>
+
+                  <button
+                    type="button"
+                    disabled={isSyncingTrades}
+                    onClick={handleSyncAccountTrades}
+                    className="w-full py-2 rounded-lg bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/40 text-emerald-300 font-bold text-xs flex items-center justify-center gap-1.5 cursor-pointer transition-all mt-2"
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${isSyncingTrades ? 'animate-spin' : ''}`} />
+                    <span>{isSyncingTrades ? 'Menyingkronkan Posisi Live & Win Rate...' : '⚡ Sinkronkan Posisi (OP) & History Trade'}</span>
+                  </button>
                 </div>
               </div>
 
@@ -562,7 +604,7 @@ export const CTraderGatewayModal: React.FC<CTraderGatewayModalProps> = ({
                               </span>
                             </div>
                             <span className="text-[10px] text-neutral-400">
-                              {acc.brokerName} • ${(acc.balance || 0).toLocaleString()} • 1:{acc.leverage || 500}
+                              {acc.brokerName} • ${((acc.balance ?? 0) > 2000 ? ((acc.balance ?? 0) / 100.0) : (acc.balance ?? 0)).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} • 1:{acc.leverage || 500}
                             </span>
                           </div>
                         </div>

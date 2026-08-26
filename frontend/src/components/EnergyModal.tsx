@@ -583,31 +583,103 @@ export const EnergyModal: React.FC<EnergyModalProps> = ({
                 Belum ada riwayat transaksi Energy.
               </div>
             ) : (
-              transactions.map((tx) => (
-                <div 
-                  key={tx.id} 
-                  className="bg-[#111111] border border-[#1f1f1f] rounded-xl p-3 flex items-center justify-between"
-                >
-                  <div className="flex items-center gap-2.5">
-                    <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${
-                      tx.amount > 0 ? 'bg-emerald-500/15 text-emerald-400' : 'bg-rose-500/15 text-rose-400'
-                    }`}>
-                      {tx.amount > 0 ? <ArrowDownLeft className="w-4 h-4" /> : <ArrowUpRight className="w-4 h-4" />}
+              transactions.map((tx: any) => {
+                const status = (tx.status || 'COMPLETED').toUpperCase();
+                const isPending = status === 'PENDING';
+                const isPaid = status === 'PAID' || status === 'COMPLETED';
+                const isExpired = status === 'EXPIRED' || tx.isExpired;
+                const payUrl = cleanMayarUrl(tx.checkoutUrl || tx.paymentUrl);
+
+                return (
+                  <div 
+                    key={tx.id} 
+                    className="bg-[#111111] border border-[#1f1f1f] rounded-xl p-3 space-y-2"
+                  >
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2.5">
+                        <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${
+                          tx.amount > 0 ? 'bg-emerald-500/15 text-emerald-400' : 'bg-rose-500/15 text-rose-400'
+                        }`}>
+                          {tx.amount > 0 ? <ArrowDownLeft className="w-4 h-4" /> : <ArrowUpRight className="w-4 h-4" />}
+                        </div>
+                        <div>
+                          <span className="font-semibold text-neutral-200 block text-xs">
+                            {tx.description || (tx.amount > 0 ? 'Top Up Energy' : 'Penggunaan Energy')}
+                          </span>
+                          <span className="text-[10px] text-neutral-500 font-mono">
+                            {tx.createdAt ? new Date(tx.createdAt).toLocaleString('id-ID') : '-'}
+                          </span>
+                        </div>
+                      </div>
+                      <div className="text-right font-mono font-bold">
+                        <span className={tx.amount > 0 ? 'text-emerald-400' : 'text-rose-400'}>
+                          {tx.amount > 0 ? `+${tx.amount}` : tx.amount} Energy
+                        </span>
+                        {tx.amountRp && tx.amountRp > 0 ? (
+                          <span className="block text-[10px] text-neutral-400 font-normal">
+                            Rp {(tx.amountRp || 0).toLocaleString('id-ID')}
+                          </span>
+                        ) : null}
+                      </div>
                     </div>
-                    <div>
-                      <span className="font-semibold text-neutral-200 block text-xs">{tx.description}</span>
-                      <span className="text-[10px] text-neutral-500 font-mono">
-                        {tx.createdAt ? new Date(tx.createdAt).toLocaleString('id-ID') : '-'}
-                      </span>
+
+                    {/* Status Badge & Payment Action */}
+                    <div className="flex items-center justify-between pt-1 border-t border-[#1a1a1a] text-[10px]">
+                      <div className="flex items-center gap-1.5">
+                        <span className="text-neutral-400">Status:</span>
+                        {isPaid && (
+                          <span className="px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 font-bold">
+                            ✓ LUNAS
+                          </span>
+                        )}
+                        {isPending && (
+                          <span className="px-2 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/30 font-bold animate-pulse">
+                            ⏳ MENUNGGU PEMBAYARAN
+                          </span>
+                        )}
+                        {isExpired && (
+                          <span className="px-2 py-0.5 rounded bg-rose-500/15 text-rose-400 border border-rose-500/30 font-bold">
+                            ✕ KADALUARSA
+                          </span>
+                        )}
+                      </div>
+
+                      {/* Active Payment Link Button */}
+                      {isPending && payUrl && !isExpired && (
+                        <div className="flex items-center gap-1.5">
+                          <button
+                            onClick={() => {
+                              triggerHaptic('medium');
+                              setActiveOrder({
+                                orderId: tx.mayarInvoiceId || tx.id,
+                                amountEnergy: tx.amount,
+                                amountRp: tx.amountRp || tx.amount * 1000,
+                                paymentUrl: payUrl,
+                                checkoutUrl: payUrl,
+                                status: 'PENDING'
+                              });
+                              setActiveTab('topup');
+                            }}
+                            className="px-2.5 py-1 rounded-lg bg-amber-500 hover:bg-amber-400 text-black font-extrabold text-[10px] flex items-center gap-1 transition-all shadow-sm shadow-amber-500/20 cursor-pointer"
+                          >
+                            <span>Bayar di Modal</span>
+                          </button>
+                          <a
+                            href={payUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            onClick={() => triggerHaptic('medium')}
+                            className="px-2.5 py-1 rounded-lg bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-500/40 font-bold text-[10px] flex items-center gap-1 transition-all cursor-pointer"
+                          >
+                            <ExternalLink className="w-3 h-3" />
+                            <span>Link Mayar</span>
+                          </a>
+                        </div>
+                      )}
                     </div>
                   </div>
-                  <div className="text-right font-mono font-bold">
-                    <span className={tx.amount > 0 ? 'text-emerald-400' : 'text-rose-400'}>
-                      {tx.amount > 0 ? `+${tx.amount}` : tx.amount} Energy
-                    </span>
-                  </div>
-                </div>
-              ))
+                );
+              })
             )}
           </div>
         )}

@@ -42,8 +42,11 @@ export const PositionProgressBar: React.FC<PositionProgressBarProps> = ({
       }
     }
   } else {
-    // Fallback if no SL/TP: show position relative to entry
-    progressPercent = isProfit ? Math.min(85, 50 + (pips * 0.5)) : Math.max(15, 50 - (Math.abs(pips) * 0.5));
+    // Fallback if no SL/TP: show position relative to entry dynamically
+    const pipsScale = trade.symbol.includes('XAU') ? 10.0 : trade.symbol.includes('BTC') ? 20.0 : 5.0;
+    progressPercent = isProfit 
+      ? Math.min(94, 50 + (pips / pipsScale)) 
+      : Math.max(6, 50 - (Math.abs(pips) / pipsScale));
     entryPercent = 50;
   }
 

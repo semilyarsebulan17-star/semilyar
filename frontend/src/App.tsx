@@ -73,6 +73,12 @@ export default function App() {
 
   // Check URL pathname for `/@username` or query params on load
   useEffect(() => {
+    const searchParams = new URLSearchParams(window.location.search);
+    if (searchParams.get('ctrader_connected') === 'true') {
+      setIsCTraderGatewayModalOpen(true);
+      window.history.replaceState({}, document.title, window.location.pathname);
+    }
+
     const pathname = window.location.pathname;
     if (pathname.startsWith('/@')) {
       const username = pathname.slice(2);
@@ -814,6 +820,7 @@ export default function App() {
             onOpenWithdrawalModal={() => setIsWithdrawalModalOpen(true)}
             onOpenKycModal={() => setIsKycModalOpen(true)}
             onUpdateUser={handleUpdateUser}
+            onCloseTrade={handleCloseTrade}
           />
         ) : currentTab === 'profile' && !activeProfileUser ? (
           /* Guest Profile Prompt: Elegant login gate when user is logged out */

@@ -354,16 +354,21 @@ export const DynamicFeedTemplate: React.FC<DynamicFeedTemplateProps> = ({
 
         {/* Status Badge & Dynamic Strategy Pill */}
         <div className="flex flex-col items-end gap-1.5 shrink-0">
-          {isOpen ? (
-            <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-emerald-500/15 text-emerald-400 border border-emerald-500/30">
-              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping" />
-              LIVE OP
+          <div className="flex items-center gap-1.5">
+            <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-mono font-black uppercase bg-emerald-500/20 text-emerald-400 border border-emerald-500/40">
+              LIVE
             </span>
-          ) : (
-            <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-[11px] font-medium bg-[#1a1a1a] text-neutral-400 border border-[#262626]">
-              CLOSED
-            </span>
-          )}
+            {isOpen ? (
+              <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-emerald-500/15 text-emerald-400 border border-emerald-500/30">
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping" />
+                LIVE OP
+              </span>
+            ) : (
+              <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-[11px] font-medium bg-[#1a1a1a] text-neutral-400 border border-[#262626]">
+                CLOSED
+              </span>
+            )}
+          </div>
 
           {/* Strategy DNA Badge with dynamic styling */}
           <div 

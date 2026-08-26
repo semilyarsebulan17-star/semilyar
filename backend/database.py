@@ -21,6 +21,20 @@ except ImportError:
 
 logger = logging.getLogger("scrolic.database")
 
+def ensure_utc(dt: Any) -> datetime:
+    if dt is None:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    if isinstance(dt, str):
+        try:
+            return datetime.fromisoformat(dt.replace("Z", "+00:00"))
+        except Exception:
+            return datetime.min.replace(tzinfo=timezone.utc)
+    if isinstance(dt, datetime):
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt
+    return datetime.min.replace(tzinfo=timezone.utc)
+
 class MemoryStore:
     def __init__(self):
         self.users: List[Dict[str, Any]] = [dict(u) for u in SEED_USERS]
@@ -314,6 +328,12 @@ class MemoryStore:
             if p.get("mayar_invoice_id") == invoice_id or p.get("id") == invoice_id:
                 return p
         return None
+
+    def find_payments_by_user(self, user_id: str) -> List[Dict[str, Any]]:
+        u = self.find_user_by_id_or_username(user_id)
+        target_id = u.get("id") if u else user_id
+        target_user = u.get("username") if u else user_id
+        return [p for p in self.payments if p.get("user_id") == target_id or p.get("user_id") == target_user]
 
     def update_payment_status(self, invoice_id: str, status: str, paid_at: Optional[datetime] = None) -> Optional[Dict[str, Any]]:
         p = self.find_payment_by_invoice_id(invoice_id)

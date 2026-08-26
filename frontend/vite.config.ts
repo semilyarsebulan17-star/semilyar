@@ -12,12 +12,12 @@ export default defineConfig(() => {
       },
     },
     server: {
-      allowedHosts: true as true,
+      allowedHosts: ['.emergentcf.cloud', '.emergentagent.com', '.scrolic.id', 'localhost', '127.0.0.1'],
       host: '0.0.0.0',
       port: 3000,
       strictPort: true,
-      hmr: process.env.DISABLE_HMR !== 'true',
-      watch: process.env.DISABLE_HMR === 'true' ? null : {},
+      hmr: false,
+      watch: null,
       // Local dev proxy: forward /api/* and /socket.io/* to the FastAPI backend on :8001.
       // When accessed via the Emergent ingress URL, ingress already routes /api/*
       // to :8001 externally; this proxy makes localhost:3000 work in isolation too.
