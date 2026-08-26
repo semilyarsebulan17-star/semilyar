@@ -44,6 +44,14 @@ class MemoryStore:
         self.notifications: List[Dict[str, Any]] = [dict(n) for n in SEED_NOTIFICATIONS]
         self.transactions: List[Dict[str, Any]] = []
         self.payments: List[Dict[str, Any]] = []
+        
+        # Dedicated Broker Persistence Collections
+        self.broker_positions: Dict[str, Dict[str, Any]] = {}       # Key: {accountId}_{positionId}
+        self.broker_deals: Dict[str, Dict[str, Any]] = {}           # Key: {accountId}_{dealId}
+        self.broker_raw_events: List[Dict[str, Any]] = []           # Sanitized raw broker events audit
+        self.reconciliation_logs: List[Dict[str, Any]] = []         # Periodic reconciliation audit logs
+        self.account_snapshots: Dict[str, List[Dict[str, Any]]] = {} # Account balance/equity time series
+
         self.db = None
         self.client = None
         self.is_mongo_connected = False
@@ -175,6 +183,11 @@ class MemoryStore:
         user_dict.setdefault("trades_count", 0)
         user_dict.setdefault("is_verified", False)
         user_dict.setdefault("ctrader_connected", False)
+        user_dict.setdefault("ctrader_account_id", None)
+        user_dict.setdefault("ctrader_accounts", [])
+        user_dict.setdefault("ctrader_access_token", None)
+        user_dict.setdefault("ctrader_refresh_token", None)
+        user_dict.setdefault("ctrader_token_expires_at", None)
         user_dict.setdefault("bank_accounts", [])
 
         if self.is_mongo_connected and self.db is not None:
@@ -349,11 +362,78 @@ class MemoryStore:
     def find_all_strategies(self) -> List[Dict[str, Any]]:
         return self.strategies
 
-    def find_strategy_by_id(self, strategy_id: str) -> Optional[Dict[str, Any]]:
-        for s in self.strategies:
-            if s.get("id") == strategy_id or s.get("slug") == strategy_id:
-                return s
-        return None
+    # Broker Raw Event Sanitized Audit Log (Retention = 1000)
+    def save_raw_broker_event(self, payload_type: int, payload_data: Dict[str, Any]):
+        sanitized = dict(payload_data)
+        # Strip credentials & tokens
+        for sensitive_key in ["accessToken", "refreshToken", "clientSecret", "password"]:
+            if sensitive_key in sanitized:
+                sanitized[sensitive_key] = "[REDACTED]"
+        
+        event_record = {
+            "payload_type": payload_type,
+            "data": sanitized,
+            "recorded_at": datetime.now(timezone.utc)
+        }
+        self.broker_raw_events.insert(0, event_record)
+        if len(self.broker_raw_events) > 1000:
+            self.broker_raw_events.pop()
+
+    # Normalized Open Position Storage (Key: {accountId}_{positionId})
+    def upsert_broker_position(self, account_id: Any, position_id: Any, position_data: Dict[str, Any]) -> Dict[str, Any]:
+        key = f"{account_id}_{position_id}"
+        position_data["account_id"] = str(account_id)
+        position_data["position_id"] = str(position_id)
+        position_data["updated_at"] = datetime.now(timezone.utc)
+        self.broker_positions[key] = position_data
+        return position_data
+
+    def get_broker_position(self, account_id: Any, position_id: Any) -> Optional[Dict[str, Any]]:
+        return self.broker_positions.get(f"{account_id}_{position_id}")
+
+    def delete_broker_position(self, account_id: Any, position_id: Any) -> bool:
+        key = f"{account_id}_{position_id}"
+        if key in self.broker_positions:
+            del self.broker_positions[key]
+            return True
+        return False
+
+    # Normalized Closed Deal Storage (Key: {accountId}_{dealId})
+    def record_broker_deal(self, account_id: Any, deal_id: Any, deal_data: Dict[str, Any]) -> Dict[str, Any]:
+        key = f"{account_id}_{deal_id}"
+        deal_data["account_id"] = str(account_id)
+        deal_data["deal_id"] = str(deal_id)
+        deal_data["recorded_at"] = datetime.now(timezone.utc)
+        self.broker_deals[key] = deal_data
+        return deal_data
+
+    def get_broker_deals_for_account(self, account_id: Any) -> List[Dict[str, Any]]:
+        acct_str = str(account_id)
+        return [d for d in self.broker_deals.values() if d.get("account_id") == acct_str]
+
+    # Reconciliation Audit Log (Retention = 200)
+    def record_reconciliation_audit(self, account_id: Any, audit_data: Dict[str, Any]):
+        audit_record = {
+            "account_id": str(account_id),
+            "data": audit_data,
+            "reconciled_at": datetime.now(timezone.utc)
+        }
+        self.reconciliation_logs.insert(0, audit_record)
+        if len(self.reconciliation_logs) > 200:
+            self.reconciliation_logs.pop()
+
+    def get_reconciliation_audit_logs(self, limit: int = 50) -> List[Dict[str, Any]]:
+        return self.reconciliation_logs[:limit]
+
+    # Historical Account Snapshot Recording
+    def record_account_snapshot(self, account_id: Any, snapshot: Dict[str, Any]):
+        acct_str = str(account_id)
+        if acct_str not in self.account_snapshots:
+            self.account_snapshots[acct_str] = []
+        snapshot["timestamp"] = datetime.now(timezone.utc)
+        self.account_snapshots[acct_str].insert(0, snapshot)
+        if len(self.account_snapshots[acct_str]) > 500:
+            self.account_snapshots[acct_str].pop()
 
 db_store = MemoryStore()
 

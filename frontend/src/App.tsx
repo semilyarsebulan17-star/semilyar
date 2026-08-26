@@ -262,9 +262,10 @@ export default function App() {
   };
 
   // 4. Real-time Socket.IO Live Feed & Position Update Subscriptions
+  // 4. Real-time Socket.IO Live Feed, Portfolio & Account Subscriptions
   useEffect(() => {
-    // Initialize socket connection
-    socketClient.connect(currentUser?.id);
+    // Initialize socket connection with room bindings
+    socketClient.connect(currentUser?.id, currentUser?.cTraderAccountId);
 
     // 4.1 On new post pushed by any trader via cTrader
     const unsubNewPost = socketClient.onNewPost((newPost: FeedPost) => {
@@ -284,12 +285,13 @@ export default function App() {
       triggerHaptic('success');
     });
 
-    // 4.2 On official SCROLIC V7 cTrader Realtime Position Update
+    // 4.2 On official SCROLIC V7 cTrader Realtime Position Update (Position-ID strict matching)
     const unsubCTraderUpdate = socketClient.onCTraderPositionUpdate((update) => {
       setPosts((prev) =>
         prev.map((p) => {
-          const matchId = update.postId || update.positionId;
-          if (p.id === matchId || p.trade.id === matchId || p.trade.id === update.positionId || p.id === update.positionId || (p.trade.symbol === update.symbol && p.trade.status === 'OPEN')) {
+          const matchId = update.postId || update.positionId || update.tradeId;
+          const isMatch = p.id === matchId || p.trade.id === matchId || p.trade.id === update.positionId || p.id === update.positionId;
+          if (isMatch) {
             return {
               ...p,
               trade: {
@@ -299,8 +301,8 @@ export default function App() {
                 profitUSD: update.profitUsd ?? update.profit ?? p.trade.profitUSD,
                 profitPercent: update.profitPercent ?? p.trade.profitPercent,
                 progress: update.progress ?? p.trade.progress,
-                stopLoss: (update.sl !== undefined && update.sl > 0) ? update.sl : p.trade.stopLoss,
-                takeProfit: (update.tp !== undefined && update.tp > 0) ? update.tp : p.trade.takeProfit
+                stopLoss: (update.stopLoss || (update.sl !== undefined && update.sl > 0)) ? (update.stopLoss ?? update.sl ?? p.trade.stopLoss) : p.trade.stopLoss,
+                takeProfit: (update.takeProfit || (update.tp !== undefined && update.tp > 0)) ? (update.takeProfit ?? update.tp ?? p.trade.takeProfit) : p.trade.takeProfit
               }
             };
           }
@@ -313,15 +315,17 @@ export default function App() {
     const unsubPositionUpdate = socketClient.onPositionUpdate((update: LivePositionUpdate) => {
       setPosts((prev) =>
         prev.map((p) => {
-          if (p.id === update.postId || p.trade.id === update.postId) {
+          const matchId = update.postId || update.positionId || update.tradeId;
+          const isMatch = p.id === matchId || p.trade.id === matchId || p.trade.id === update.positionId || p.id === update.positionId;
+          if (isMatch) {
             return {
               ...p,
               trade: {
                 ...p.trade,
-                currentPrice: update.currentPrice,
-                pips: update.pips,
-                profitUSD: update.profit,
-                profitPercent: update.profitPercent,
+                currentPrice: update.currentPrice ?? p.trade.currentPrice,
+                pips: update.pips ?? p.trade.pips,
+                profitUSD: update.profit ?? p.trade.profitUSD,
+                profitPercent: update.profitPercent ?? p.trade.profitPercent,
                 progress: update.progress ?? p.trade.progress
               }
             };
@@ -331,25 +335,51 @@ export default function App() {
       );
     });
 
-    // 4.3 On position closed settlement
+    // 4.4 On position closed settlement (moves from Live OP to Portfolio History)
     const unsubPositionClosed = socketClient.onPositionClosed((payload: PositionClosedPayload) => {
       setPosts((prev) =>
         prev.map((p) => {
-          if (p.id === payload.postId || p.trade.id === payload.postId) {
+          const matchId = payload.postId || payload.positionId || payload.tradeId;
+          const isMatch = p.id === matchId || p.trade.id === matchId || p.trade.id === payload.positionId || p.id === payload.positionId;
+          if (isMatch) {
             return {
               ...p,
               trade: {
                 ...p.trade,
                 status: 'CLOSED',
-                profitUSD: payload.profit,
-                pips: payload.pips,
-                closeTime: payload.closedAt
+                closePrice: payload.closePrice ?? p.trade.closePrice,
+                profitUSD: payload.profit ?? p.trade.profitUSD,
+                closeTime: payload.closedAt ?? new Date().toISOString()
               }
             };
           }
           return p;
         })
       );
+      triggerHaptic('selection');
+    });
+
+    // 4.5 On Account Metrics Update (Realtime Balance & Equity)
+    const unsubAccountMetrics = socketClient.onAccountMetrics((metrics) => {
+      if (currentUser && (metrics.accountId === currentUser.cTraderAccountId || metrics.ctidTraderAccountId)) {
+        setCurrentUser((prev) => {
+          if (!prev) return null;
+          return {
+            ...prev,
+            cTraderAccounts: prev.cTraderAccounts?.map((acc) =>
+              acc.accountId === metrics.accountId
+                ? { ...acc, balance: metrics.balance, currency: metrics.currency }
+                : acc
+            )
+          };
+        });
+      }
+    });
+
+    // 4.6 On Reconnect: Fetch Latest Snapshot automatically
+    const unsubReconnect = socketClient.onReconnect(() => {
+      console.log('[Socket] Reconnected - Fetching fresh snapshot...');
+      fetchInitialData();
     });
 
     return () => {
@@ -357,25 +387,31 @@ export default function App() {
       unsubCTraderUpdate();
       unsubPositionUpdate();
       unsubPositionClosed();
+      unsubAccountMetrics();
+      unsubReconnect();
     };
-  }, [currentUser?.id]);
+  }, [currentUser?.id, currentUser?.cTraderAccountId]);
 
-  // Update liveTrades and closedTrades whenever posts change
+  // Update liveTrades and closedTrades filtered strictly by active currentUser (Portfolio Isolation)
   useEffect(() => {
-    const opens: Trade[] = [];
-    const closeds: Trade[] = [];
+    if (!currentUser) {
+      setLiveTrades([]);
+      setClosedTrades([]);
+      return;
+    }
 
-    posts.forEach((p) => {
-      if (p.trade.status === 'OPEN') {
-        opens.push(p.trade);
-      } else {
-        closeds.push(p.trade);
-      }
-    });
+    const isUserTrade = (p: FeedPost) =>
+      p.userId === currentUser.id ||
+      p.user?.username === currentUser.username ||
+      p.user?.id === currentUser.id;
+
+    const userPosts = posts.filter(isUserTrade);
+    const opens = userPosts.filter((p) => p.trade.status === 'OPEN').map((p) => p.trade);
+    const closeds = userPosts.filter((p) => p.trade.status === 'CLOSED').map((p) => p.trade);
 
     setLiveTrades(opens);
     setClosedTrades(closeds);
-  }, [posts]);
+  }, [posts, currentUser?.id, currentUser?.username]);
 
   // Auth gate helper
   const requireAuth = (reason: string, action: () => void) => {

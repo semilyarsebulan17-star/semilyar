@@ -29,6 +29,8 @@ import { LoginRequiredGate } from '../components/LoginRequiredGate';
 import { FP_MARKETS_REGISTER_URL, CTRADER_GRANT_ACCESS_URL } from '../components/CTraderGatewayModal';
 import { triggerHaptic } from '../utils/haptics';
 
+import { socketClient, AccountMetricsPayload, ConnectionStatusPayload } from '../services/socketClient';
+
 interface DashboardViewProps {
   currentUser: User | null;
   liveTrades: Trade[];
@@ -58,6 +60,57 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   const [isSyncing, setIsSyncing] = useState(false);
   const [syncSuccessMsg, setSyncSuccessMsg] = useState<string | null>(null);
   const [isSwitching, setIsSwitching] = useState(false);
+  const [accountMetrics, setAccountMetrics] = useState<AccountMetricsPayload | null>(null);
+  const [connectionStatus, setConnectionStatus] = useState<ConnectionStatusPayload | null>(null);
+
+  // Live account metrics and connection state
+  React.useEffect(() => {
+    if (!currentUser?.cTraderConnected) return;
+
+    // Fetch initial metrics snapshot
+    const fetchMetrics = async () => {
+      try {
+        const savedUserId = localStorage.getItem('scrolic_user_id') || currentUser.id;
+        const res = await fetch('/api/ctrader/account/metrics', {
+          headers: { 'x-session-user-id': savedUserId }
+        });
+        const data = await res.json();
+        if (data.metrics) {
+          setAccountMetrics(data.metrics);
+        }
+      } catch (err) {
+        console.warn('[Dashboard] Error fetching account metrics:', err);
+      }
+    };
+
+    const fetchConnStatus = async () => {
+      try {
+        const res = await fetch('/api/ctrader/connection/status');
+        const data = await res.json();
+        if (data.connection) {
+          setConnectionStatus(data.connection);
+        }
+      } catch (err) {
+        console.warn('[Dashboard] Error fetching connection status:', err);
+      }
+    };
+
+    fetchMetrics();
+    fetchConnStatus();
+
+    const unsubMetrics = socketClient.onAccountMetrics((metrics) => {
+      setAccountMetrics(metrics);
+    });
+
+    const unsubConn = socketClient.onConnectionStatus((status) => {
+      setConnectionStatus(status);
+    });
+
+    return () => {
+      unsubMetrics();
+      unsubConn();
+    };
+  }, [currentUser?.id, currentUser?.cTraderAccountId, currentUser?.cTraderConnected]);
 
   if (!currentUser) {
     return (
@@ -80,11 +133,16 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   const handleQuickSwitch = async (acc: typeof currentAccounts[0]) => {
     if (acc.accountId === currentUser.cTraderAccountId && currentUser.cTraderConnected) return;
     setIsSwitching(true);
+    setAccountMetrics(null); // Clear old state before loading new account
     triggerHaptic('selection');
     try {
+      const savedUserId = localStorage.getItem('scrolic_user_id') || currentUser.id;
       const res = await fetch('/api/ctrader/switch', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 
+          'Content-Type': 'application/json',
+          'x-session-user-id': savedUserId
+        },
         body: JSON.stringify({
           accountId: acc.accountId,
           broker: acc.brokerName || 'FP Markets',
@@ -96,6 +154,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       if (onUpdateUser) {
         onUpdateUser(data.user);
       }
+      socketClient.joinAccountRoom(acc.accountId);
       triggerHaptic('success');
     } catch (err: any) {
       alert(err.message || 'Gagal beralih akun cTrader');
@@ -105,15 +164,29 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   };
 
   // Re-sync cTrader
-  const handleManualSync = () => {
+  const handleManualSync = async () => {
     setIsSyncing(true);
     triggerHaptic('medium');
-    setTimeout(() => {
-      setIsSyncing(false);
-      setSyncSuccessMsg('Posisi cTrader tersinkronisasi 100% real-time!');
+    try {
+      const savedUserId = localStorage.getItem('scrolic_user_id') || currentUser.id;
+      await fetch('/api/ctrader/sync', {
+        headers: { 'x-session-user-id': savedUserId }
+      });
+      const mRes = await fetch('/api/ctrader/account/metrics', {
+        headers: { 'x-session-user-id': savedUserId }
+      });
+      const mData = await mRes.json();
+      if (mData.metrics) {
+        setAccountMetrics(mData.metrics);
+      }
+      setSyncSuccessMsg('Posisi & Saldo cTrader berhasil disinkronkan!');
       triggerHaptic('success');
       setTimeout(() => setSyncSuccessMsg(null), 3500);
-    }, 1000);
+    } catch (err) {
+      console.warn('[Dashboard] Manual sync error:', err);
+    } finally {
+      setIsSyncing(false);
+    }
   };
 
   // Compute live performance metrics
@@ -269,13 +342,26 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 </div>
               </div>
 
-              <span className={`text-[9px] font-mono px-2 py-0.5 rounded-full font-bold uppercase ${
-                currentUser.cTraderConnected
-                  ? 'bg-emerald-500/25 text-emerald-300 border border-emerald-500/40'
-                  : 'bg-amber-500/25 text-amber-300 border border-amber-500/40'
-              }`}>
-                {currentUser.cTraderConnected ? 'Connected' : 'Disconnected'}
-              </span>
+              <div className="flex items-center gap-1.5">
+                {accountMetrics?.isStale && (
+                  <span className="text-[9px] font-mono px-2 py-0.5 rounded-full font-bold uppercase bg-amber-500/25 text-amber-300 border border-amber-500/40">
+                    Stale (&gt;45s)
+                  </span>
+                )}
+                <span className={`text-[9px] font-mono px-2 py-0.5 rounded-full font-bold uppercase ${
+                  !currentUser.cTraderConnected
+                    ? 'bg-neutral-800 text-neutral-400 border border-neutral-700'
+                    : connectionStatus?.state === 'DEGRADED'
+                    ? 'bg-amber-500/25 text-amber-300 border border-amber-500/40'
+                    : 'bg-emerald-500/25 text-emerald-300 border border-emerald-500/40'
+                }`}>
+                  {!currentUser.cTraderConnected 
+                    ? 'Disconnected' 
+                    : connectionStatus?.state === 'DEGRADED'
+                    ? 'Degraded'
+                    : 'Connected • Live Realtime'}
+                </span>
+              </div>
             </div>
 
             {/* Active Account Card & Switcher */}
@@ -301,13 +387,36 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
 
                 <div className="text-right font-mono">
                   <span className="text-xs font-black text-white block">
-                    {currentUser.cTraderConnected ? `$${(activeAccount?.balance || 0).toLocaleString()} USD` : '$0 USD'}
+                    {currentUser.cTraderConnected ? `$${(accountMetrics?.balance ?? activeAccount?.balance ?? 0).toLocaleString('en-US', { minimumFractionDigits: 2 })} ${accountMetrics?.currency || 'USD'}` : '$0 USD'}
                   </span>
-                  <span className="text-[9px] text-neutral-400">
-                    {currentUser.cTraderConnected ? `Leverage 1:${activeAccount?.leverage || 500}` : 'Status: Belum Terhubung'}
+                  <span className="text-[9px] text-emerald-300/80 block">
+                    Equity: ${accountMetrics ? accountMetrics.equity.toLocaleString('en-US', { minimumFractionDigits: 2 }) : (activeAccount?.balance || 0).toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                  </span>
+                  <span className="text-[8px] text-neutral-400">
+                    {currentUser.cTraderConnected ? `Leverage 1:${accountMetrics?.leverage || activeAccount?.leverage || 500}` : 'Status: Belum Terhubung'}
                   </span>
                 </div>
               </div>
+
+              {/* Realtime Margin & Equity Bar */}
+              {currentUser.cTraderConnected && accountMetrics && (
+                <div className="grid grid-cols-3 gap-1 pt-2 border-t border-emerald-500/20 text-center font-mono text-[9px]">
+                  <div className="bg-[#091f13] p-1.5 rounded-lg border border-emerald-500/15">
+                    <span className="text-neutral-400 block font-sans text-[8px]">Floating PnL</span>
+                    <span className={`font-bold ${accountMetrics.unrealizedPnL >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                      {accountMetrics.unrealizedPnL >= 0 ? '+' : ''}${accountMetrics.unrealizedPnL.toFixed(2)}
+                    </span>
+                  </div>
+                  <div className="bg-[#091f13] p-1.5 rounded-lg border border-emerald-500/15">
+                    <span className="text-neutral-400 block font-sans text-[8px]">Free Margin</span>
+                    <span className="font-bold text-white">${accountMetrics.freeMargin.toLocaleString('en-US', { minimumFractionDigits: 1 })}</span>
+                  </div>
+                  <div className="bg-[#091f13] p-1.5 rounded-lg border border-emerald-500/15">
+                    <span className="text-neutral-400 block font-sans text-[8px]">Margin Level</span>
+                    <span className="font-bold text-amber-300">{accountMetrics.marginLevel !== null ? `${accountMetrics.marginLevel}%` : 'N/A'}</span>
+                  </div>
+                </div>
+              )}
 
               {/* Account Switcher Pills */}
               {currentAccounts.length > 0 && (

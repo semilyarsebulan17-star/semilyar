@@ -48,14 +48,26 @@ def get_mayar_base_url() -> str:
 EMERGENT_LLM_KEY = os.environ.get("EMERGENT_LLM_KEY", "").strip()
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3-flash-preview")
 
-def get_ctrader_client_id() -> str:
-    return (os.environ.get("CTRADER_CLIENT_ID") or "spotware_scrolic_prod_client").strip()
-
-def get_ctrader_client_secret() -> str:
-    return (os.environ.get("CTRADER_CLIENT_SECRET") or "spotware_scrolic_prod_secret").strip()
-
-def get_ctrader_env() -> str:
-    return (os.environ.get("CTRADER_ENV") or "live").strip()
+try:
+    from backend.ctrader_config import (
+        get_ctrader_client_id,
+        get_ctrader_client_secret,
+        get_ctrader_env,
+        mask_credential,
+        get_active_endpoint,
+        AUTH_BASE_URL,
+        TOKEN_ENDPOINT_URL
+    )
+except ImportError:
+    from ctrader_config import (
+        get_ctrader_client_id,
+        get_ctrader_client_secret,
+        get_ctrader_env,
+        mask_credential,
+        get_active_endpoint,
+        AUTH_BASE_URL,
+        TOKEN_ENDPOINT_URL
+    )
 
 def get_ctrader_proxy_url() -> str:
     return (os.environ.get("CTRADER_PROXY_URL") or "").strip()
@@ -80,6 +92,26 @@ try:
     @sio.event
     async def connect(sid, environ, auth=None):
         logger.info(f"[socket.io] Client connected: {sid}")
+        if auth and isinstance(auth, dict) and auth.get("userId"):
+            user_room = f"user_{auth['userId']}"
+            await sio.enter_room(sid, user_room)
+            logger.info(f"[socket.io] Client {sid} auto-joined private room: {user_room}")
+
+    @sio.on("join:user_room")
+    async def handle_join_user_room(sid, data):
+        u_id = data.get("userId") if isinstance(data, dict) else str(data)
+        if u_id:
+            room_name = f"user_{u_id}"
+            await sio.enter_room(sid, room_name)
+            logger.info(f"[socket.io] Client {sid} joined private room: {room_name}")
+
+    @sio.on("join:account_room")
+    async def handle_join_account_room(sid, data):
+        acct_id = data.get("accountId") if isinstance(data, dict) else str(data)
+        if acct_id:
+            room_name = f"account_{acct_id}"
+            await sio.enter_room(sid, room_name)
+            logger.info(f"[socket.io] Client {sid} joined private room: {room_name}")
 
     @sio.event
     async def disconnect(sid):
@@ -118,6 +150,39 @@ try:
 except ImportError:
     from ticker import live_trading_service
 
+try:
+    from backend.ctrader_client import ctrader_client
+except ImportError:
+    from ctrader_client import ctrader_client
+
+try:
+    from backend.ctrader_oauth import (
+        generate_oauth_state,
+        validate_oauth_state,
+        get_canonical_redirect_uri,
+        get_grant_access_url,
+        exchange_code_for_token,
+        fetch_and_validate_accounts,
+        refresh_user_token,
+        token_refresh_supervisor
+    )
+except ImportError:
+    from ctrader_oauth import (
+        generate_oauth_state,
+        validate_oauth_state,
+        get_canonical_redirect_uri,
+        get_grant_access_url,
+        exchange_code_for_token,
+        fetch_and_validate_accounts,
+        refresh_user_token,
+        token_refresh_supervisor
+    )
+
+try:
+    from backend.event_contract import event_contract_manager
+except ImportError:
+    from event_contract import event_contract_manager
+
 fastapi_app = FastAPI(title="Scrolic Single-Runtime Backend")
 fastapi_app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
@@ -140,12 +205,27 @@ async def on_startup():
     await init_db()
     if HAS_SOCKETIO and sio is not None:
         live_trading_service.set_sio(sio)
+        
+        def _on_client_lifecycle_event(evt_name, data):
+            diag = ctrader_client.get_diagnostics()
+            payload = event_contract_manager.build_connection_status_payload(diag)
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.create_task(sio.emit("connection:status_update", payload))
+                loop.create_task(sio.emit("ctrader:connection_update", payload))
+
+        ctrader_client.register_event_listener(_on_client_lifecycle_event)
+
     live_trading_service.start(2.5)
+    await ctrader_client.start()
+    token_refresh_supervisor.start()
     logger.info(f"[scrolic.backend] Single-runtime FastAPI backend running. Mayar API Key configured: {bool(get_mayar_api_key())}")
 
 @fastapi_app.on_event("shutdown")
 async def on_shutdown():
     live_trading_service.stop()
+    await ctrader_client.stop()
+    token_refresh_supervisor.stop()
 
 def get_current_user_id(request: Request, x_session_user_id: Optional[str] = Header(None)) -> Optional[str]:
     return x_session_user_id or active_session_user_id
@@ -613,53 +693,40 @@ async def get_payment_transactions(x_session_user_id: Optional[str] = Header(Non
     return {"success": True, "transactions": formatted}
 
 # ---------------- cTrader Open API Integration ----------------
+# ---------------- cTrader Open API Integration ----------------
 def get_redirect_uri(request: Request) -> str:
-    env_redirect = os.environ.get("CTRADER_REDIRECT_URI", "").strip()
-    if env_redirect:
-        return env_redirect
-    
-    host = request.headers.get("x-forwarded-host") or request.headers.get("host", "127.0.0.1:8001")
-    proto = request.headers.get("x-forwarded-proto") or request.url.scheme
-    if "127.0.0.1" in host or "localhost" in host:
-        return "http://localhost:8001/api/ctrader/callback"
+    return get_canonical_redirect_uri(request)
 
-    if "127.0.0.1" not in host and "localhost" not in host:
-        proto = "https"
-
-    return f"{proto}://{host}/api/ctrader/callback"
-
-def get_ctrader_auth_url(redirect_uri: str, state: str = "") -> str:
-    scope = "trading"
-    client_id = get_ctrader_client_id()
-    base_url = "https://connect.spotware.com"
-    encoded_redirect = urllib.parse.quote(redirect_uri, safe="")
-    return f"{base_url}/apps/auth?client_id={client_id}&redirect_uri={encoded_redirect}&scope={scope}&state={state}"
+def get_ctrader_auth_url(redirect_uri: str, user_id: str = "") -> str:
+    return get_grant_access_url(redirect_uri, user_id)
 
 def ensure_valid_ctrader_token(user_id: str) -> bool:
     user = db_store.find_user_by_id_or_username(user_id)
     if not user or not user.get("ctrader_connected"):
         return False
     
+    token = user.get("ctrader_access_token")
+    if not token:
+        return False
+
     expires_at = user.get("ctrader_token_expires_at")
     now = datetime.now(timezone.utc)
-    if isinstance(expires_at, datetime):
-        if expires_at < now + timedelta(minutes=5):
-            new_expires = now + timedelta(days=30)
-            db_store.update_user(user.get("id") or user.get("username"), {
-                "ctrader_token_expires_at": new_expires,
-                "ctrader_access_token": f"ct_live_refreshed_{int(now.timestamp())}"
-            })
-            logger.info(f"[cTrader.OAuth] Auto-refreshed access token for user: {user.get('username')}")
+    if isinstance(expires_at, datetime) and expires_at < now:
+        refresh_token = user.get("ctrader_refresh_token")
+        if not refresh_token:
+            db_store.update_user(user.get("id") or user.get("username"), {"ctrader_connected": False})
+            return False
     return True
 
 @fastapi_app.get("/api/ctrader/config")
-async def get_ctrader_config(request: Request):
-    redirect_uri = get_redirect_uri(request)
-    grant_url = get_ctrader_auth_url(redirect_uri)
+async def get_ctrader_config(request: Request, x_session_user_id: Optional[str] = Header(None)):
+    target_user_id = x_session_user_id or active_session_user_id or ""
+    redirect_uri = get_canonical_redirect_uri(request)
+    grant_url = get_grant_access_url(redirect_uri, target_user_id)
     return {
         "clientId": CTRADER_CLIENT_ID,
         "environment": CTRADER_ENV,
-        "isConfigured": True,
+        "isConfigured": bool(CTRADER_CLIENT_ID and CTRADER_CLIENT_SECRET),
         "redirectUri": redirect_uri,
         "grantAccessUrl": grant_url
     }
@@ -670,12 +737,24 @@ async def get_ctrader_auth_url_endpoint(
     x_session_user_id: Optional[str] = Header(None),
     userId: Optional[str] = Query(None),
     user_id: Optional[str] = Query(None),
-    json_format: bool = Query(False, alias="json")
+    json_format: bool = Query(False, alias="json"),
+    response: Response = None
 ):
     target_user_id = userId or user_id or x_session_user_id or active_session_user_id or ""
-    redirect_uri = get_redirect_uri(request)
-    url = get_ctrader_auth_url(redirect_uri, target_user_id)
+    redirect_uri = get_canonical_redirect_uri(request)
+    url = get_grant_access_url(redirect_uri, target_user_id)
+    state = urllib.parse.parse_qs(urllib.parse.urlparse(url).query).get("state", [""])[0]
     if json_format or "application/json" in request.headers.get("accept", ""):
+        if response is not None and state:
+            response.set_cookie(
+                "ctrader_oauth_state",
+                state,
+                max_age=900,
+                httponly=True,
+                secure=request.url.scheme == "https",
+                samesite="lax",
+                path="/api/ctrader"
+            )
         return {"success": True, "url": url, "authUrl": url, "clientId": CTRADER_CLIENT_ID, "redirectUri": redirect_uri}
     return RedirectResponse(url, status_code=307)
 
@@ -686,113 +765,70 @@ async def get_ctrader_auth_url_endpoint(
 async def ctrader_oauth_callback(request: Request, code: str = Query(""), state: str = Query("")):
     global active_session_user_id
     try:
-        target_user_id = state or active_session_user_id or ""
-        user = db_store.find_user_by_id_or_username(target_user_id) if target_user_id else None
-        if not user and db_store.users:
-            user = db_store.users[0]
+        if not code:
+            logger.warning("[cTrader.OAuth] Callback invoked without authorization code.")
+            return RedirectResponse(url="/?ctrader_error=missing_code", status_code=302)
 
-        access_token = f"ct_live_token_{int(datetime.now().timestamp())}"
-        refresh_token = f"ct_ref_token_{int(datetime.now().timestamp())}"
-        fetched_accounts = []
-        
-        redirect_uri = get_redirect_uri(request)
-        client_id = get_ctrader_client_id()
-        client_secret = os.environ.get("CTRADER_CLIENT_SECRET", "").strip()
+        # 1. Strict Cryptographic State Validation & CSRF Protection.
+        # Some broker redirects omit the query state; recover only the signed state
+        # issued by this origin in the short-lived HttpOnly cookie.
+        callback_state = state or request.cookies.get("ctrader_oauth_state", "")
+        is_valid_state, target_user_id, state_err = validate_oauth_state(callback_state)
+        if not is_valid_state or not target_user_id:
+            logger.error(f"[cTrader.OAuth] State validation rejected: {state_err}")
+            return RedirectResponse(url=f"/?ctrader_error=invalid_state&reason={urllib.parse.quote(state_err or 'CSRF')}", status_code=302)
 
-        # 1. Exchange code with Spotware Open API via HTTP POST with form-urlencoded payload
-        if code and client_id and client_secret:
-            try:
-                token_url = "https://connect.spotware.com/apps/token"
-                post_data = urllib.parse.urlencode({
-                    "grant_type": "authorization_code",
-                    "code": code,
-                    "client_id": client_id,
-                    "client_secret": client_secret,
-                    "redirect_uri": redirect_uri
-                }).encode('utf-8')
+        # 2. Strict User Correlation (NO fallback to arbitrary users!)
+        user = db_store.find_user_by_id_or_username(target_user_id)
+        if not user:
+            logger.error(f"[cTrader.OAuth] Verified user_id '{target_user_id}' from state not found in database.")
+            return RedirectResponse(url="/?ctrader_error=user_not_found", status_code=302)
 
-                token_req = urllib.request.Request(
-                    token_url,
-                    data=post_data,
-                    headers={
-                        "Content-Type": "application/x-www-form-urlencoded",
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-                        "Accept": "application/json"
-                    },
-                    method="POST"
-                )
-                with urllib.request.urlopen(token_req, timeout=12) as resp:
-                    raw_body = resp.read().decode('utf-8')
-                    token_data = json.loads(raw_body)
-                    access_token = token_data.get("accessToken") or token_data.get("access_token") or access_token
-                    refresh_token = token_data.get("refreshToken") or token_data.get("refresh_token") or refresh_token
+        redirect_uri = get_canonical_redirect_uri(request)
 
-                    logger.info(f"[cTrader.OAuth] Token exchange SUCCESS! Received access_token: {access_token[:12]}...")
+        # 3. Official Authorization Code Exchange
+        try:
+            token_res = await exchange_code_for_token(code, redirect_uri)
+        except Exception as ex_err:
+            logger.error(f"[cTrader.OAuth] Token exchange failed: {ex_err}")
+            return RedirectResponse(url=f"/?ctrader_error=token_exchange_failed&reason={urllib.parse.quote(str(ex_err))}", status_code=302)
 
-                    # Fetch Real Trading Accounts from Spotware Connect API
-                    acct_endpoints = [
-                        f"https://api.spotware.com/connect/tradingaccounts?oauth_token={access_token}",
-                        f"https://openapi.spotware.com/apps/token/accounts?oauth_token={access_token}"
-                    ]
-                    for acct_url in acct_endpoints:
-                        try:
-                            acct_req = urllib.request.Request(
-                                acct_url,
-                                headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
-                            )
-                            with urllib.request.urlopen(acct_req, timeout=10) as acct_resp:
-                                acct_data = json.loads(acct_resp.read().decode('utf-8'))
-                                raw_list = acct_data if isinstance(acct_data, list) else acct_data.get("data") or acct_data.get("accounts") or []
-                                if raw_list:
-                                    fetched_accounts = []
-                                    for a in raw_list:
-                                        acct_num = str(a.get("accountNo") or a.get("traderLogin") or a.get("accountId") or a.get("id"))
-                                        raw_bal = a.get("balance", 0)
-                                        balance_val = round(float(raw_bal) / 100.0, 2) if raw_bal else 0.0
-                                        fetched_accounts.append({
-                                            "accountId": f"cTrader-{acct_num}",
-                                            "accountNo": acct_num,
-                                            "brokerName": a.get("brokerTitle") or a.get("brokerName") or a.get("broker") or "Spotware cTrader ECN",
-                                            "accountType": "LIVE" if (a.get("live") or a.get("isLive", True)) else "DEMO",
-                                            "currency": a.get("depositCurrency") or a.get("currency") or "USD",
-                                            "balance": balance_val,
-                                            "leverage": a.get("leverage", 500),
-                                            "isLive": bool(a.get("live") or a.get("isLive", True))
-                                        })
-                                    if fetched_accounts:
-                                        logger.info(f"[cTrader.OAuth] Successfully fetched {len(fetched_accounts)} real accounts from Spotware!")
-                                        break
-                        except Exception as acct_err:
-                            logger.warning(f"[cTrader.OAuth] Account endpoint warning ({acct_url}): {acct_err}")
+        access_token = token_res.get("accessToken")
+        refresh_token = token_res.get("refreshToken")
+        expires_in = token_res.get("expiresIn", 2592000)
 
-            except Exception as err:
-                logger.error(f"[cTrader.OAuth] Token exchange HTTP POST error: {err}")
+        if not access_token:
+            logger.error("[cTrader.OAuth] No access token in Spotware exchange response.")
+            return RedirectResponse(url="/?ctrader_error=token_exchange_failed", status_code=302)
 
-        # Ensure only real accounts fetched from Spotware are saved
-        if not fetched_accounts and user:
-            existing_accounts = user.get("ctrader_accounts") or []
-            if existing_accounts:
-                fetched_accounts = existing_accounts
+        # 4. Mandatory Account Verification with Spotware API before claiming connected
+        validated_accounts = await fetch_and_validate_accounts(access_token)
+        if not validated_accounts:
+            logger.warning("[cTrader.OAuth] No verified trading accounts returned from Spotware Open API. Connected state not asserted.")
+            return RedirectResponse(url="/?ctrader_error=no_authorized_accounts", status_code=302)
 
-        primary_acct_id = fetched_accounts[0]["accountId"] if fetched_accounts else ""
+        primary_acct_id = validated_accounts[0]["accountId"]
+        expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
 
-        if user:
-            expires_at = datetime.now(timezone.utc) + timedelta(days=30)
-            user_updates = {
-                "ctrader_connected": True,
-                "ctrader_account_id": primary_acct_id,
-                "ctrader_accounts": fetched_accounts,
-                "ctrader_access_token": access_token,
-                "ctrader_refresh_token": refresh_token,
-                "ctrader_token_expires_at": expires_at
-            }
-            db_store.update_user(user.get("id") or user.get("username"), user_updates)
-            active_session_user_id = user.get("id") or user.get("username")
-            user = db_store.find_user_by_id_or_username(user.get("id") or user.get("username"))
+        # 5. Persist securely to user record
+        user_updates = {
+            "ctrader_connected": True,
+            "ctrader_account_id": primary_acct_id,
+            "ctrader_accounts": validated_accounts,
+            "ctrader_access_token": access_token,
+            "ctrader_refresh_token": refresh_token,
+            "ctrader_token_expires_at": expires_at
+        }
+        db_store.update_user(user.get("id") or user.get("username"), user_updates)
+        active_session_user_id = user.get("id") or user.get("username")
+        user = db_store.find_user_by_id_or_username(user.get("id") or user.get("username"))
+
+        # 6. Authenticate account on persistent background client
+        asyncio.create_task(ctrader_client.authenticate_account(primary_acct_id, access_token))
 
         user_formatted = format_auth_user_response(user) if user else {}
         user_json_str = json.dumps(user_formatted, default=str)
-        accounts_json_str = json.dumps(fetched_accounts, default=str)
+        accounts_json_str = json.dumps(validated_accounts, default=str)
 
         html = f"""
         <!DOCTYPE html>
@@ -812,7 +848,7 @@ async def ctrader_oauth_callback(request: Request, code: str = Query(""), state:
           <body>
             <div class="card">
               <div class="title">⚡ cTrader Open API Terhubung!</div>
-              <div class="desc">Otorisasi cTrader Open API berhasil. Mengalihkan ke aplikasi Scrolic...</div>
+              <div class="desc">Otorisasi cTrader Open API berhasil diverifikasi. Mengalihkan ke aplikasi Scrolic...</div>
               <div class="badge">{primary_acct_id}</div>
               <a id="btn-redirect" href="/?ctrader_connected=true" class="btn">
                 Buka Aplikasi Scrolic Sekarang
@@ -826,26 +862,32 @@ async def ctrader_oauth_callback(request: Request, code: str = Query(""), state:
                 user: {user_json_str if user else 'null'}
               }};
 
-              // 1. Try sending postMessage to parent window if popup
+                            // 1. Send the verified account list to the Scrolic window and close this popup.
+                            let popupHandled = false;
               try {{
                 if (window.opener && !window.opener.closed) {{
                   window.opener.postMessage(payload, '*');
-                  setTimeout(() => {{ window.close(); }}, 400);
+                                    setTimeout(() => {{ window.close(); }}, 150);
+                                    popupHandled = true;
                 }}
               }} catch(e) {{}}
 
-              // 2. Redirect current tab back to Scrolic main app
-              setTimeout(() => {{
-                window.location.href = '/?ctrader_connected=true';
-              }}, 500);
+                            // 2. OAuth may have been opened in the current tab; redirect only as a fallback.
+                            if (!popupHandled) {{
+                                setTimeout(() => {{
+                                    window.location.href = '/?ctrader_connected=true';
+                                }}, 250);
+                            }}
             </script>
           </body>
         </html>
         """
-        return HTMLResponse(html)
+        callback_response = HTMLResponse(html)
+        callback_response.delete_cookie("ctrader_oauth_state", path="/api/ctrader")
+        return callback_response
     except Exception as exc:
         logger.error(f"[cTrader.OAuth Exception] {exc}", exc_info=True)
-        return RedirectResponse(url="/?ctrader_connected=true&status=success", status_code=302)
+        return RedirectResponse(url="/?ctrader_error=oauth_exception", status_code=302)
 
 async def sync_ctrader_account_trades(user_id: str) -> dict:
     user = db_store.find_user_by_id_or_username(user_id)
@@ -923,6 +965,8 @@ async def sync_ctrader_account_trades(user_id: str) -> dict:
                 matched["pips"] = pips
                 matched["progress"] = progress
                 matched["status"] = "OPEN"
+                matched["source"] = "broker_ctrader"
+                matched["is_simulation"] = False
             else:
                 db_store.create_post({
                     "id": f"post-ctrader-{pos_id}",
@@ -947,183 +991,14 @@ async def sync_ctrader_account_trades(user_id: str) -> dict:
                     "visibility": "LOCKED",
                     "unlock_price": 1,
                     "follow_price": 1,
+                    "source": "broker_ctrader",
+                    "is_simulation": False,
+                    "account_type": "LIVE" if bool(user.get("ctrader_accounts", [{}])[0].get("isLive")) else "DEMO",
                     "auto_description": f"⚡ Posisi Terbuka (OP) cTrader ({account_id}): {trade_side} {round(vol, 2)} Lot {symbol} @ {entry} (Floating {'Loss' if pnl < 0 else 'Profit'} ${pnl})",
                     "custom_description": f"Koneksi Live Trading Account cTrader {account_id}"
                 })
 
-    # Ensure user has posts for active OP positions and closed portfolio history
-    if not existing_user_posts and account_id:
-        db_store.create_post({
-            "id": f"post-ctrader-{account_id}-op1",
-            "user_id": user_uid,
-            "username": user.get("username"),
-            "avatar": user.get("avatar"),
-            "trade_id": f"trade-{account_id}-op1",
-            "symbol": "XAUUSD",
-            "market": "Commodity",
-            "strategy_id": user.get("strategy_dna", "breakout"),
-            "position_type": "BUY",
-            "status": "OPEN",
-            "entry_price": 2915.90,
-            "current_price": 2914.50,
-            "progress": 42,
-            "profit": -1.40,
-            "profit_percent": -0.14,
-            "lot": 0.01,
-            "pips": -14.0,
-            "duration": "Live OP",
-            "opened_at": datetime.now(timezone.utc),
-            "visibility": "LOCKED",
-            "unlock_price": 1,
-            "follow_price": 1,
-            "auto_description": f"⚡ Posisi Terbuka (OP) cTrader ({account_id}): BUY 0.01 Lot XAUUSD @ 2915.90 (Floating Loss -$1.40)",
-            "custom_description": f"Posisi Live Terhubung dari akun cTrader {account_id}"
-        })
-        db_store.create_post({
-            "id": f"post-ctrader-{account_id}-op2",
-            "user_id": user_uid,
-            "username": user.get("username"),
-            "avatar": user.get("avatar"),
-            "trade_id": f"trade-{account_id}-op2",
-            "symbol": "BTCUSD",
-            "market": "Crypto",
-            "strategy_id": user.get("strategy_dna", "breakout"),
-            "position_type": "BUY",
-            "status": "OPEN",
-            "entry_price": 66565.0,
-            "current_price": 66500.0,
-            "progress": 44,
-            "profit": -0.65,
-            "profit_percent": -0.07,
-            "lot": 0.01,
-            "pips": -65.0,
-            "duration": "Live OP",
-            "opened_at": datetime.now(timezone.utc),
-            "visibility": "LOCKED",
-            "unlock_price": 1,
-            "follow_price": 1,
-            "auto_description": f"⚡ Posisi Terbuka (OP) cTrader ({account_id}): BUY 0.01 Lot BTCUSD @ 66565.0 (Floating Loss -$0.65)",
-            "custom_description": f"Posisi Live Terhubung dari akun cTrader {account_id}"
-        })
-
-        db_store.create_post({
-            "id": f"post-ctrader-{account_id}-hist1",
-            "user_id": user_uid,
-            "username": user.get("username"),
-            "avatar": user.get("avatar"),
-            "trade_id": f"trade-{account_id}-hist1",
-            "symbol": "BTCUSD",
-            "market": "Crypto",
-            "strategy_id": user.get("strategy_dna", "breakout"),
-            "position_type": "BUY",
-            "status": "CLOSED",
-            "entry_price": 66500.0,
-            "current_price": 68350.0,
-            "profit": 1850.00,
-            "profit_percent": 18.5,
-            "lot": 1.0,
-            "pips": 185.0,
-            "duration": "4h 12m",
-            "opened_at": datetime.now(timezone.utc),
-            "closed_at": datetime.now(timezone.utc),
-            "visibility": "LOCKED",
-            "unlock_price": 1,
-            "follow_price": 1,
-            "auto_description": f"Closed Deal via cTrader ({account_id}): BUY 1.00 Lot BTCUSD +$1,850.00",
-            "custom_description": f"Transaksi cTrader {account_id} Selesai (Profit)"
-        })
-        db_store.create_post({
-            "id": f"post-ctrader-{account_id}-hist2",
-            "user_id": user_uid,
-            "username": user.get("username"),
-            "avatar": user.get("avatar"),
-            "trade_id": f"trade-{account_id}-hist2",
-            "symbol": "GBPUSD",
-            "market": "Forex",
-            "strategy_id": user.get("strategy_dna", "breakout"),
-            "position_type": "SELL",
-            "status": "CLOSED",
-            "entry_price": 1.29500,
-            "current_price": 1.29080,
-            "profit": 420.00,
-            "profit_percent": 4.2,
-            "lot": 0.3,
-            "pips": 42.0,
-            "duration": "1h 45m",
-            "opened_at": datetime.now(timezone.utc),
-            "closed_at": datetime.now(timezone.utc),
-            "visibility": "LOCKED",
-            "unlock_price": 1,
-            "follow_price": 1,
-            "auto_description": f"Closed Deal via cTrader ({account_id}): SELL 0.30 Lot GBPUSD +$420.00",
-            "custom_description": f"Transaksi cTrader {account_id} Selesai (Profit)"
-        })
-        db_store.create_post({
-            "id": f"post-ctrader-{account_id}-hist3",
-            "user_id": user_uid,
-            "username": user.get("username"),
-            "avatar": user.get("avatar"),
-            "trade_id": f"trade-{account_id}-hist3",
-            "symbol": "XAUUSD",
-            "market": "Commodity",
-            "strategy_id": user.get("strategy_dna", "breakout"),
-            "position_type": "BUY",
-            "status": "CLOSED",
-            "entry_price": 2900.00,
-            "current_price": 2895.80,
-            "profit": -210.00,
-            "profit_percent": -2.1,
-            "lot": 0.5,
-            "pips": -42.0,
-            "duration": "25m",
-            "opened_at": datetime.now(timezone.utc),
-            "closed_at": datetime.now(timezone.utc),
-            "visibility": "LOCKED",
-            "unlock_price": 1,
-            "follow_price": 1,
-            "auto_description": f"Closed Deal via cTrader ({account_id}): BUY 0.50 Lot XAUUSD -$210.00",
-            "custom_description": f"Transaksi cTrader {account_id} Selesai (SL Hit)"
-        })
-        db_store.create_post({
-            "id": f"post-ctrader-{account_id}-hist4",
-            "user_id": user_uid,
-            "username": user.get("username"),
-            "avatar": user.get("avatar"),
-            "trade_id": f"trade-{account_id}-hist4",
-            "symbol": "EURUSD",
-            "market": "Forex",
-            "strategy_id": user.get("strategy_dna", "breakout"),
-            "position_type": "BUY",
-            "status": "CLOSED",
-            "entry_price": 1.07800,
-            "current_price": 1.08480,
-            "profit": 680.00,
-            "profit_percent": 6.8,
-            "lot": 1.0,
-            "pips": 68.0,
-            "duration": "3h 10m",
-            "opened_at": datetime.now(timezone.utc),
-            "closed_at": datetime.now(timezone.utc),
-            "visibility": "LOCKED",
-            "unlock_price": 1,
-            "follow_price": 1,
-            "auto_description": f"Closed Deal via cTrader ({account_id}): BUY 1.00 Lot EURUSD +$680.00",
-            "custom_description": f"Transaksi cTrader {account_id} Selesai (Profit)"
-        })
-
-    # Deduplicate open positions per symbol for clean 2 OP display
-    seen_symbols = set()
-    cleaned_posts = []
-    for p in db_store.posts:
-        if p.get("status") == "OPEN":
-            sym = p.get("symbol")
-            if sym in seen_symbols:
-                continue
-            seen_symbols.add(sym)
-        cleaned_posts.append(p)
-    db_store.posts = cleaned_posts
-
-    # Recalculate Win Rate %, Total Profit USD, Total Pips & Total Trades
+    # Recalculate Win Rate %, Total Profit USD, Total Pips & Total Trades from real posts
     all_user_posts = [p for p in db_store.posts if (p.get("user_id") == user_uid or p.get("username") == user.get("username"))]
     closed_posts = [p for p in all_user_posts if p.get("status") == "CLOSED"]
     
@@ -1159,31 +1034,39 @@ async def ctrader_connect(request: Request, x_session_user_id: Optional[str] = H
         raise HTTPException(404, "User tidak ditemukan")
 
     body = await request.json()
-    account_id = body.get("accountId", f"cTrader-{(hash(user['username']) % 899999) + 100000}").strip()
-    accounts = body.get("accounts") or [
-        {
+    account_id = body.get("accountId", "").strip()
+    accounts = body.get("accounts") or user.get("ctrader_accounts") or []
+
+    # If the user does not have a validated access token from OAuth, mark as DEMO simulation
+    has_oauth_token = bool(user.get("ctrader_access_token") or body.get("accessToken"))
+    if not accounts and account_id:
+        accounts = [{
             "accountId": account_id,
-            "brokerName": body.get("broker", "Spotware cTrader Open API"),
-            "accountType": "LIVE",
+            "brokerName": body.get("broker", "Spotware cTrader Sandbox"),
+            "accountType": "LIVE" if has_oauth_token else "DEMO",
             "currency": "USD",
             "balance": 10000.0,
             "leverage": 500,
-            "isLive": True
-        }
-    ]
+            "isLive": has_oauth_token,
+            "source": "broker_ctrader" if has_oauth_token else "simulated"
+        }]
 
-    expires_at = datetime.now(timezone.utc) + timedelta(days=30)
-    db_store.update_user(curr_id, {
-        "ctrader_connected": True,
-        "ctrader_account_id": account_id,
-        "ctrader_accounts": accounts,
-        "ctrader_access_token": f"ct_live_token_{int(datetime.now().timestamp())}",
-        "ctrader_refresh_token": f"ct_ref_token_{int(datetime.now().timestamp())}",
-        "ctrader_token_expires_at": expires_at
-    })
-    await sync_ctrader_account_trades(curr_id)
+    primary_id = account_id or (accounts[0]["accountId"] if accounts else "")
+    updates = {
+        "ctrader_connected": True if accounts else False,
+        "ctrader_account_id": primary_id,
+        "ctrader_accounts": accounts
+    }
+    if body.get("accessToken"):
+        updates["ctrader_access_token"] = body["accessToken"]
+        updates["ctrader_token_expires_at"] = datetime.now(timezone.utc) + timedelta(days=30)
+
+    db_store.update_user(curr_id, updates)
+    if accounts and has_oauth_token:
+        await sync_ctrader_account_trades(curr_id)
     updated_user = db_store.find_user_by_id_or_username(curr_id)
-    return {"success": True, "user": format_auth_user_response(updated_user), "message": "cTrader Open API berhasil terhubung"}
+    return {"success": True, "user": format_auth_user_response(updated_user), "message": "cTrader Open API akun berhasil diperbarui"}
+
 
 @fastapi_app.post("/api/ctrader/switch")
 async def ctrader_switch(request: Request, x_session_user_id: Optional[str] = Header(None)):
@@ -1195,17 +1078,92 @@ async def ctrader_switch(request: Request, x_session_user_id: Optional[str] = He
         raise HTTPException(404, "User tidak ditemukan")
 
     body = await request.json()
-    account_id = body.get("accountId", "").strip()
-    if not account_id:
+    raw_account_id = body.get("accountId", "").strip()
+    if not raw_account_id:
         raise HTTPException(400, "Account ID wajib diisi")
 
+    # 1. Validate that selected account is in OAuth-authorized accounts whitelist
+    user_accounts = user.get("ctrader_accounts", [])
+    target_acct = next(
+        (a for a in user_accounts if a.get("accountId") == raw_account_id or a.get("accountNo") == raw_account_id or a.get("accountId") == f"cTrader-{raw_account_id}"),
+        None
+    )
+    if not target_acct:
+        raise HTTPException(400, f"ACCOUNT_NOT_AUTHORIZED: Akun {raw_account_id} tidak terdaftar dalam otorisasi OAuth pengguna ini.")
+
+    # 2. Environment Isolation Validation (Demo vs Live)
+    is_acct_live = target_acct.get("isLive", False) or target_acct.get("accountType") == "LIVE"
+    if CTRADER_ENV == "demo" and is_acct_live:
+        raise HTTPException(400, "ENVIRONMENT_MISMATCH: Akun tipe LIVE tidak dapat diaktifkan pada environment DEMO.")
+    elif CTRADER_ENV == "live" and not is_acct_live:
+        raise HTTPException(400, "ENVIRONMENT_MISMATCH: Akun tipe DEMO tidak dapat diaktifkan pada environment LIVE.")
+
+    old_acct_id = user.get("ctrader_account_id", "")
+    target_acct_id = target_acct.get("accountId")
+    access_token = user.get("ctrader_access_token", "")
+
+    # 3. Trigger account switch & reconciliation on persistent client
+    await ctrader_client.switch_account(old_acct_id, target_acct_id, access_token, curr_id)
+
     db_store.update_user(curr_id, {
-        "ctrader_account_id": account_id,
+        "ctrader_account_id": target_acct_id,
         "ctrader_connected": True
     })
     await sync_ctrader_account_trades(curr_id)
     updated_user = db_store.find_user_by_id_or_username(curr_id)
-    return {"success": True, "user": format_auth_user_response(updated_user), "message": f"Berhasil beralih ke akun {account_id}"}
+    return {"success": True, "user": format_auth_user_response(updated_user), "message": f"Berhasil beralih ke akun {target_acct_id}"}
+
+@fastapi_app.get("/api/ctrader/accounts/status")
+async def ctrader_accounts_status(x_session_user_id: Optional[str] = Header(None)):
+    curr_id = x_session_user_id or active_session_user_id
+    if not curr_id:
+        raise HTTPException(401, "Harap login terlebih dahulu")
+    user = db_store.find_user_by_id_or_username(curr_id)
+    if not user:
+        raise HTTPException(404, "User tidak ditemukan")
+
+    user_accounts = user.get("ctrader_accounts", [])
+    account_statuses = []
+    for acct in user_accounts:
+        acct_id = acct.get("accountId")
+        st = ctrader_client.get_account_status(acct_id)
+        account_statuses.append({
+            "accountId": acct_id,
+            "accountNo": acct.get("accountNo"),
+            "brokerName": acct.get("brokerName"),
+            "accountType": acct.get("accountType"),
+            "balance": acct.get("balance"),
+            "currency": acct.get("currency"),
+            "isLive": acct.get("isLive", False),
+            "isActive": acct_id == user.get("ctrader_account_id"),
+            "authStatus": st.get("authStatus"),
+            "authenticatedAt": st.get("authenticatedAt"),
+            "lastReconciledAt": st.get("lastReconciledAt"),
+            "lastError": st.get("lastError")
+        })
+
+    return {
+        "success": True,
+        "activeAccountId": user.get("ctrader_account_id"),
+        "environment": CTRADER_ENV,
+        "accounts": account_statuses
+    }
+
+@fastapi_app.get("/api/ctrader/account/metrics")
+async def ctrader_account_metrics(x_session_user_id: Optional[str] = Header(None)):
+    curr_id = x_session_user_id or active_session_user_id
+    if not curr_id:
+        raise HTTPException(401, "Harap login terlebih dahulu")
+    user = db_store.find_user_by_id_or_username(curr_id)
+    if not user:
+        raise HTTPException(404, "User tidak ditemukan")
+
+    active_acct_id = user.get("ctrader_account_id") or ""
+    metrics = live_trading_service.get_account_live_state(active_acct_id)
+    return {
+        "success": True,
+        "metrics": metrics
+    }
 
 @fastapi_app.get("/api/ctrader/sync")
 @fastapi_app.post("/api/ctrader/sync")
@@ -1257,16 +1215,111 @@ async def ctrader_token_refresh(x_session_user_id: Optional[str] = Header(None))
     curr_id = x_session_user_id or active_session_user_id
     if not curr_id:
         raise HTTPException(401, "Harap login terlebih dahulu")
-    ensure_valid_ctrader_token(curr_id)
+    
+    success = await refresh_user_token(curr_id)
     user = db_store.find_user_by_id_or_username(curr_id)
+    if not success:
+        return JSONResponse({
+            "success": False,
+            "message": "Gagal memperbarui access token cTrader dengan Spotware API. Status diubah ke DISCONNECTED.",
+            "status": {
+                "isConnected": False,
+                "hasAccessToken": False
+            }
+        }, status_code=400)
+
     return {
         "success": True,
-        "message": "Access token cTrader berhasil diperbarui otomatis",
+        "message": "Access token cTrader berhasil diperbarui dan divalidasi",
         "status": {
             "isConnected": bool(user and user.get("ctrader_connected")),
             "hasAccessToken": True,
             "expiresAt": user.get("ctrader_token_expires_at").isoformat() if (user and isinstance(user.get("ctrader_token_expires_at"), datetime)) else None
         }
+    }
+
+@fastapi_app.get("/api/ctrader/connection/status")
+async def ctrader_connection_status():
+    return {
+        "success": True,
+        "connection": ctrader_client.get_diagnostics()
+    }
+
+@fastapi_app.get("/api/ctrader/diagnostics")
+async def ctrader_diagnostics():
+    return {
+        "success": True,
+        "diagnostics": ctrader_client.get_diagnostics(),
+        "alarms": ctrader_client.get_observability_alarms()
+    }
+
+@fastapi_app.get("/api/ctrader/observability/dashboard")
+async def ctrader_observability_dashboard(x_session_user_id: Optional[str] = Header(None)):
+    curr_id = x_session_user_id or active_session_user_id
+    diag = ctrader_client.get_diagnostics()
+    alarms = ctrader_client.get_observability_alarms()
+    
+    user_status = None
+    if curr_id:
+        u = db_store.find_user_by_id_or_username(curr_id)
+        if u and u.get("ctrader_account_id"):
+            user_status = live_trading_service.get_account_live_state(u.get("ctrader_account_id"))
+
+    return {
+        "success": True,
+        "runtime": {
+            "owner": "FastAPI Single Runtime",
+            "port": 8001,
+            "node_runtime_deactivated": True
+        },
+        "connection": diag,
+        "currentUserAccountState": user_status,
+        "accountsOverview": list(ctrader_client.account_states.values()),
+        "metrics": ctrader_client.metrics,
+        "alarms": alarms,
+        "reconciliationLogs": db_store.get_reconciliation_audit_logs(20),
+        "timestamp": int(time.time() * 1000)
+    }
+
+@fastapi_app.get("/api/ctrader/health")
+async def ctrader_health_endpoint():
+    diag = ctrader_client.get_diagnostics()
+    alarms = ctrader_client.get_observability_alarms()
+    
+    app_health = {
+        "status": "healthy",
+        "runtime": "FastAPI :8001",
+        "database": "MemoryStore/Persistent",
+        "uptime": time.time()
+    }
+    
+    socketio_health = {
+        "status": "healthy" if HAS_SOCKETIO else "degraded",
+        "is_asgi": True,
+        "cors": "allowed"
+    }
+    
+    broker_health = {
+        "status": "healthy" if diag["state"] in ["CONNECTED", "AUTHENTICATED"] else "degraded" if diag["state"] == "DEGRADED" else "disconnected",
+        "state": diag["state"],
+        "is_connected": diag["is_broker_connected"],
+        "is_authenticated": diag["is_authenticated"],
+        "transport": diag["transport"],
+        "host": diag["host"],
+        "authenticated_accounts_count": diag["authenticated_accounts_count"],
+        "last_broker_to_db_latency_ms": ctrader_client.metrics.get("last_broker_to_db_latency_ms", 0.0),
+        "last_message_at": diag["last_message_at"],
+        "last_error": diag["last_error"]
+    }
+    
+    is_healthy = broker_health["status"] in ["healthy", "disconnected"]
+    
+    return {
+        "status": "healthy" if is_healthy else "degraded",
+        "app": app_health,
+        "socketio": socketio_health,
+        "ctrader_broker": broker_health,
+        "alarms": alarms
     }
 
 # ---------------- Market Orders & Ikuti Setup ----------------
@@ -1325,6 +1378,43 @@ async def ctrader_order_market(request: Request, x_session_user_id: Optional[str
             pass
 
     return {"success": True, "executionEvent": {"positionId": new_post["id"], "status": "OPEN", "post": formatted}}
+
+@fastapi_app.post("/api/ctrader/positions/{position_id}/close")
+async def ctrader_close_position_endpoint(position_id: str, request: Request, x_session_user_id: Optional[str] = Header(None)):
+    curr_id = x_session_user_id or active_session_user_id
+    if not curr_id:
+        raise HTTPException(401, "Harap login terlebih dahulu")
+    user = db_store.find_user_by_id_or_username(curr_id)
+    if not user:
+        raise HTTPException(404, "User tidak ditemukan")
+
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+
+    volume_lot = float(body.get("volumeLot")) if body.get("volumeLot") else None
+    account_id = user.get("ctrader_account_id") or ""
+
+    post = next((p for p in db_store.posts if p.get("trade_id") == position_id or p.get("id") == position_id or p.get("id") == f"post-ctrader-{account_id}-{position_id}"), None)
+    if post:
+        account_id = post.get("account_id") or account_id
+
+    if not account_id:
+        raise HTTPException(400, "Account ID tidak ditemukan untuk posisi ini.")
+
+    # Dispatch official close request to Spotware broker
+    success = await ctrader_client.close_position(account_id, position_id, volume_lot)
+    if not success:
+        return JSONResponse({"success": False, "message": "Gagal mengirim permintaan close posisi ke broker cTrader"}, status_code=500)
+
+    return {
+        "success": True,
+        "message": f"Permintaan close posisi {position_id} telah dikirim ke broker cTrader. Menunggu konfirmasi eksekusi.",
+        "positionId": position_id,
+        "status": "CLOSE_REQUESTED"
+    }
 
 @fastapi_app.post("/api/posts/{post_id}/follow-setup")
 async def follow_setup(post_id: str, request: Request, x_session_user_id: Optional[str] = Header(None)):
@@ -1905,11 +1995,15 @@ async def health_proxy():
     return {
         "ok": True,
         "service": "scrolic-fastapi-single-runtime",
-        "node_alive": True,
         "runtime": "Python FastAPI Single-Runtime",
+        "single_runtime": "FastAPI",
+        "ctrader_runtime_owner": "fastapi",
+        "node_alive": False,
+        "ctrader_env": CTRADER_ENV,
         "gemini_model": GEMINI_MODEL,
         "llm_configured": bool(EMERGENT_LLM_KEY),
-        "mayar_configured": bool(get_mayar_api_key())
+        "mayar_configured": bool(get_mayar_api_key()),
+        "ctrader_configured": bool(CTRADER_CLIENT_ID and CTRADER_CLIENT_SECRET)
     }
 
 @fastapi_app.get("/")

@@ -150,19 +150,29 @@ export const CTraderGatewayModal: React.FC<CTraderGatewayModalProps> = ({
   const handleOpenGrantAccess = async () => {
     triggerHaptic('selection');
     setHasGrantedAccessPrompt(true);
+    const popup = window.open('', 'cTraderOAuthPopup', 'width=600,height=750,scrollbars=yes,status=yes');
+
+    if (!popup) {
+      setConnectError('Popup cTrader diblokir browser. Izinkan popup untuk melanjutkan otorisasi.');
+      return;
+    }
+
     try {
-      const uId = encodeURIComponent(currentUser.id || currentUser.username || '');
-      const res = await fetch(`/api/ctrader/auth-url?json=true&userId=${uId}`);
+      const userId = currentUser.id || currentUser.username || '';
+      const uId = encodeURIComponent(userId);
+      const res = await fetch(`/api/ctrader/auth-url?json=true&userId=${uId}`, {
+        headers: { 'x-session-user-id': userId }
+      });
       const data = await res.json();
-      const targetUrl = data.authUrl || data.url || config.grantAccessUrl;
+      const targetUrl = data.authUrl || data.url;
       if (targetUrl) {
-        window.open(targetUrl, 'cTraderOAuthPopup', 'width=600,height=750,scrollbars=yes,status=yes');
+        popup.location.href = targetUrl;
       } else {
-        window.open(`/api/ctrader/auth-url?userId=${uId}`, 'cTraderOAuthPopup', 'width=600,height=750,scrollbars=yes,status=yes');
+        throw new Error('URL otorisasi cTrader tidak tersedia.');
       }
     } catch {
-      const fallbackUrl = config.grantAccessUrl || `/api/ctrader/auth-url?userId=${encodeURIComponent(currentUser.id || currentUser.username)}`;
-      window.open(fallbackUrl, 'cTraderOAuthPopup', 'width=600,height=750,scrollbars=yes,status=yes');
+      const userId = currentUser.id || currentUser.username || '';
+      popup.location.href = `/api/ctrader/auth-url?userId=${encodeURIComponent(userId)}`;
     }
   };
 
