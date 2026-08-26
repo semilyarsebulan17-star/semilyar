@@ -284,7 +284,32 @@ export default function App() {
       triggerHaptic('success');
     });
 
-    // 4.2 On position price/pips/PnL update from live cTrader ProtoOA tick
+    // 4.2 On official SCROLIC V7 cTrader Realtime Position Update
+    const unsubCTraderUpdate = socketClient.onCTraderPositionUpdate((update) => {
+      setPosts((prev) =>
+        prev.map((p) => {
+          const matchId = update.postId || update.positionId;
+          if (p.id === matchId || p.trade.id === matchId || p.trade.id === update.positionId || p.id === update.positionId || (p.trade.symbol === update.symbol && p.trade.status === 'OPEN')) {
+            return {
+              ...p,
+              trade: {
+                ...p.trade,
+                currentPrice: update.current ?? update.currentPrice ?? p.trade.currentPrice,
+                pips: update.pips ?? p.trade.pips,
+                profitUSD: update.profitUsd ?? update.profit ?? p.trade.profitUSD,
+                profitPercent: update.profitPercent ?? p.trade.profitPercent,
+                progress: update.progress ?? p.trade.progress,
+                stopLoss: (update.sl !== undefined && update.sl > 0) ? update.sl : p.trade.stopLoss,
+                takeProfit: (update.tp !== undefined && update.tp > 0) ? update.tp : p.trade.takeProfit
+              }
+            };
+          }
+          return p;
+        })
+      );
+    });
+
+    // 4.3 On position price/pips/PnL update from live cTrader ProtoOA tick
     const unsubPositionUpdate = socketClient.onPositionUpdate((update: LivePositionUpdate) => {
       setPosts((prev) =>
         prev.map((p) => {
@@ -296,7 +321,8 @@ export default function App() {
                 currentPrice: update.currentPrice,
                 pips: update.pips,
                 profitUSD: update.profit,
-                profitPercent: update.profitPercent
+                profitPercent: update.profitPercent,
+                progress: update.progress ?? p.trade.progress
               }
             };
           }
@@ -328,6 +354,7 @@ export default function App() {
 
     return () => {
       unsubNewPost();
+      unsubCTraderUpdate();
       unsubPositionUpdate();
       unsubPositionClosed();
     };

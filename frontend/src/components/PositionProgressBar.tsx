@@ -22,8 +22,8 @@ export const PositionProgressBar: React.FC<PositionProgressBarProps> = ({
   const hasSL = stopLoss > 0;
   const hasTP = takeProfit > 0;
 
-  // Calculate percentage along the SL -> Entry -> TP line
-  let progressPercent = 50; // default middle
+  // Calculate percentage along the SL -> Entry -> TP line according to SCROLIC V7 spec
+  let progressPercent = 50;
   let entryPercent = 50;
 
   if (hasSL && hasTP) {
@@ -31,22 +31,30 @@ export const PositionProgressBar: React.FC<PositionProgressBarProps> = ({
       const totalRange = takeProfit - stopLoss;
       if (totalRange > 0) {
         entryPercent = Math.max(10, Math.min(90, ((entryPrice - stopLoss) / totalRange) * 100));
-        progressPercent = Math.max(4, Math.min(96, ((currentPrice - stopLoss) / totalRange) * 100));
+        progressPercent = Math.max(0, Math.min(100, ((currentPrice - stopLoss) / totalRange) * 100));
       }
     } else {
       // For SELL: Stop loss is HIGHER than entry, Take profit is LOWER than entry
       const totalRange = stopLoss - takeProfit;
       if (totalRange > 0) {
         entryPercent = Math.max(10, Math.min(90, ((stopLoss - entryPrice) / totalRange) * 100));
-        progressPercent = Math.max(4, Math.min(96, ((stopLoss - currentPrice) / totalRange) * 100));
+        progressPercent = Math.max(0, Math.min(100, ((stopLoss - currentPrice) / totalRange) * 100));
       }
     }
+  } else if (hasTP) {
+    // Progress relative to TP
+    if (isBuy && takeProfit > entryPrice) {
+      progressPercent = Math.max(0, Math.min(100, ((currentPrice - entryPrice) / (takeProfit - entryPrice)) * 100));
+    } else if (!isBuy && entryPrice > takeProfit) {
+      progressPercent = Math.max(0, Math.min(100, ((entryPrice - currentPrice) / (entryPrice - takeProfit)) * 100));
+    }
+    entryPercent = 50;
   } else {
     // Fallback if no SL/TP: show position relative to entry dynamically
     const pipsScale = trade.symbol.includes('XAU') ? 10.0 : trade.symbol.includes('BTC') ? 20.0 : 5.0;
     progressPercent = isProfit 
-      ? Math.min(94, 50 + (pips / pipsScale)) 
-      : Math.max(6, 50 - (Math.abs(pips) / pipsScale));
+      ? Math.min(96, 50 + (pips / pipsScale)) 
+      : Math.max(4, 50 - (Math.abs(pips) / pipsScale));
     entryPercent = 50;
   }
 

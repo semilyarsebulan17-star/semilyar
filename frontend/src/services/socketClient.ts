@@ -26,10 +26,31 @@ export interface EnergyUpdatePayload {
   addedEnergy?: number;
 }
 
+export interface CTraderPositionUpdatePayload {
+  positionId: string;
+  postId?: string;
+  symbol: string;
+  side: 'BUY' | 'SELL';
+  direction?: 'BUY' | 'SELL';
+  entry: number;
+  current: number;
+  currentPrice?: number;
+  pips: number;
+  profitUsd: number;
+  profit?: number;
+  profitPercent?: number;
+  sl?: number;
+  tp?: number;
+  progress?: number;
+  status?: 'OPEN' | 'CLOSED';
+  timestamp: number;
+}
+
 class SocketClient {
   private socket: Socket | null = null;
   private newPostListeners: Set<(post: FeedPost) => void> = new Set();
   private positionUpdateListeners: Set<(update: LivePositionUpdate) => void> = new Set();
+  private cTraderPositionListeners: Set<(payload: CTraderPositionUpdatePayload) => void> = new Set();
   private positionClosedListeners: Set<(payload: PositionClosedPayload) => void> = new Set();
   private cTraderLogListeners: Set<(log: any) => void> = new Set();
   private energyUpdateListeners: Set<(payload: EnergyUpdatePayload) => void> = new Set();
@@ -56,6 +77,17 @@ class SocketClient {
         if (userId) {
           this.socket?.emit('join:user', userId);
         }
+      });
+
+      // SCROLIC V7 Official cTrader Realtime Event
+      this.socket.on('ctrader:position:update', (payload: CTraderPositionUpdatePayload) => {
+        this.cTraderPositionListeners.forEach((cb) => {
+          try {
+            cb(payload);
+          } catch (err) {
+            console.error('[SocketClient] ctrader:position:update listener error:', err);
+          }
+        });
       });
 
       this.socket.on('feed:new_post', (post: FeedPost) => {
@@ -116,6 +148,11 @@ class SocketClient {
       this.isConnecting = false;
       console.warn('[SocketClient] Socket.IO initialization warning:', err);
     }
+  }
+
+  public onCTraderPositionUpdate(callback: (payload: CTraderPositionUpdatePayload) => void): () => void {
+    this.cTraderPositionListeners.add(callback);
+    return () => this.cTraderPositionListeners.delete(callback);
   }
 
   public onEnergyUpdate(callback: (payload: EnergyUpdatePayload) => void): () => void {

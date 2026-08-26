@@ -23,12 +23,14 @@ import { withdrawalRoutes } from './server/routes/withdrawalRoutes';
 import { adminRoutes } from './server/routes/adminRoutes';
 import { socketService } from './server/services/socketService';
 import { liveTradingService } from './server/services/liveTradingService';
+import { ctraderPositionService } from './server/services/ctraderPositionService';
 
 dotenv.config({ path: '/app/backend/.env' });
 
 const app = express();
 const httpServer = http.createServer(app);
 const PORT = parseInt(process.env.PORT || '3001', 10);
+const HOST = process.env.HOST || '0.0.0.0';
 
 socketService.init(httpServer);
 
@@ -86,10 +88,10 @@ async function startServer() {
     console.warn('[Server Startup] Database connection warning:', dbErr.message);
   }
 
-  liveTradingService.startBackgroundTicker(2500);
+  ctraderPositionService.start(2000);
 
-  httpServer.listen(PORT, '127.0.0.1', () => {
-    console.log(`[Scrolic.node] API + Socket.IO on http://127.0.0.1:${PORT}`);
+  httpServer.listen(PORT, HOST, () => {
+    console.log(`[Scrolic.node] SCROLIC V7 API + Socket.IO on http://${HOST}:${PORT}`);
   });
 }
 
