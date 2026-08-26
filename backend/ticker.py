@@ -40,7 +40,9 @@ try:
         PROTO_OA_SPOT_EVENT,
         PROTO_OA_EXECUTION_EVENT,
         PROTO_OA_RECONCILE_RES,
-        PROTO_OA_TRADER_RES
+        PROTO_OA_TRADER_RES,
+        PROTO_OA_DEAL_LIST_RES,
+        PROTO_OA_MARGIN_CHANGED_EVENT
     )
 except ImportError:
     from ctrader_client import (
@@ -49,7 +51,9 @@ except ImportError:
         PROTO_OA_SPOT_EVENT,
         PROTO_OA_EXECUTION_EVENT,
         PROTO_OA_RECONCILE_RES,
-        PROTO_OA_TRADER_RES
+        PROTO_OA_TRADER_RES,
+        PROTO_OA_DEAL_LIST_RES,
+        PROTO_OA_MARGIN_CHANGED_EVENT
     )
 
 try:
@@ -179,6 +183,8 @@ class CTraderPositionService:
         ctrader_client.register_handler(PROTO_OA_EXECUTION_EVENT, self.handle_execution_event)
         ctrader_client.register_handler(PROTO_OA_RECONCILE_RES, self.handle_reconcile_event)
         ctrader_client.register_handler(PROTO_OA_TRADER_RES, self.handle_trader_event)
+        ctrader_client.register_handler(PROTO_OA_DEAL_LIST_RES, self.handle_deal_list_event)
+        ctrader_client.register_handler(PROTO_OA_MARGIN_CHANGED_EVENT, self.handle_margin_event)
 
     def set_sio(self, sio_instance):
         self.sio = sio_instance
@@ -203,23 +209,21 @@ class CTraderPositionService:
         Parses live bid/ask prices and updates open positions.
         """
         try:
-            symbol_id = event_data.get("symbolId")
+            symbol_id = int(event_data.get("symbolId")) if event_data.get("symbolId") is not None else None
             meta = symbol_registry.resolve(symbol_id=symbol_id)
             symbol_name = meta["name"]
-            digits = meta.get("digits", 5)
-
             raw_bid = event_data.get("bid")
             raw_ask = event_data.get("ask")
             ts = event_data.get("timestamp") or int(time.time() * 1000)
 
-            # ProtoOASpotEvent exposes bid/ask as broker price doubles.
+            # ProtoOASpotEvent encodes bid/ask in 1e-5 price units.
             if raw_bid is not None:
-                bid_val = float(raw_bid)
+                bid_val = float(raw_bid) / 100000.0 if abs(float(raw_bid)) >= 100000 else float(raw_bid)
             else:
                 bid_val = self.market_prices.get(symbol_name, {}).get("bid", 0.0)
 
             if raw_ask is not None:
-                ask_val = float(raw_ask)
+                ask_val = float(raw_ask) / 100000.0 if abs(float(raw_ask)) >= 100000 else float(raw_ask)
             else:
                 ask_val = self.market_prices.get(symbol_name, {}).get("ask", bid_val + (10 ** (-meta["pipPosition"]) * 0.2))
 
@@ -249,7 +253,7 @@ class CTraderPositionService:
         Synchronizes broker open positions into database feed.
         """
         try:
-            acct_num = event_data.get("ctidTraderAccountId")
+            acct_num = int(event_data.get("ctidTraderAccountId")) if event_data.get("ctidTraderAccountId") is not None else 0
             user_id = ctrader_client.account_to_user_map.get(acct_num, "user-alex")
             positions = event_data.get("position", [])
             logger.info(f"[cTrader.Reconcile] Reconciling {len(positions)} active positions for account {acct_num} (User: {user_id})")
@@ -260,7 +264,8 @@ class CTraderPositionService:
                 pos_id = str(pos.get("positionId"))
                 reconciled_position_ids.add(pos_id)
                 trade_data = position_trade_data(pos)
-                symbol_id = trade_data.get("symbolId") or pos.get("symbolId")
+                raw_symbol_id = trade_data.get("symbolId") or pos.get("symbolId")
+                symbol_id = int(raw_symbol_id) if raw_symbol_id is not None else None
                 meta = symbol_registry.resolve(symbol_id=symbol_id, symbol_name=pos.get("symbolName"))
                 symbol = meta["name"]
                 
@@ -373,11 +378,57 @@ class CTraderPositionService:
                             account["leverage"] = account_state.get("leverage", account.get("leverage", 500))
                             account["currency"] = account_state.get("currency", account.get("currency", "USD"))
                     db_store.update_user(user.get("id") or user.get("username"), {"ctrader_accounts": accounts})
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    loop.create_task(self.emit_account_update(f"cTrader-{acct_num}"))
+            db_store.record_account_snapshot(f"cTrader-{acct_num}", self.get_account_live_state(f"cTrader-{acct_num}"))
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.create_task(self.emit_account_update(f"cTrader-{acct_num}"))
         except Exception as exc:
             logger.error(f"[cTrader.Trader] handle_trader_event error: {exc}", exc_info=True)
+
+    def handle_margin_event(self, event_data: Dict[str, Any]):
+        acct_num = int(event_data.get("ctidTraderAccountId") or 0)
+        if acct_num:
+            ctrader_client.account_states.setdefault(acct_num, {}).update({
+                "marginUpdatedAt": datetime.now(timezone.utc).isoformat(),
+                "marginEvent": event_data
+            })
+            try:
+                loop = asyncio.get_running_loop()
+                if self.sio:
+                    loop.create_task(self.emit_account_update(f"cTrader-{acct_num}"))
+            except RuntimeError:
+                pass
+
+    def handle_deal_list_event(self, event_data: Dict[str, Any]):
+        acct_num = int(event_data.get("ctidTraderAccountId") or 0)
+        for deal in event_data.get("deal", []) or []:
+            deal_id = deal.get("dealId")
+            if acct_num and deal_id:
+                db_store.record_broker_deal(acct_num, deal_id, deal)
+                self.processed_deal_ids.add(str(deal_id))
+                position_id = str(deal.get("positionId") or "")
+                if position_id and deal.get("closePositionDetail"):
+                    post_id = f"post-ctrader-{acct_num}-{position_id}"
+                    post = db_store.find_post_by_id(post_id)
+                    if post and post.get("status") != "CLOSED":
+                        detail = deal.get("closePositionDetail") or {}
+                        money_digits = int(detail.get("moneyDigits") or deal.get("moneyDigits") or 2)
+                        scale = 10 ** money_digits
+                        profit = float(detail.get("grossProfit") or 0.0) / scale
+                        swap = float(detail.get("swap") or 0.0) / scale
+                        commission = float(detail.get("commission") or 0.0) / scale
+                        close_price = float(deal.get("executionPrice") or post.get("current_price") or 0.0)
+                        closed_at = datetime.fromtimestamp(
+                            int(deal.get("executionTimestamp") or time.time() * 1000) / 1000,
+                            tz=timezone.utc
+                        )
+                        db_store.update_post(post_id, {
+                            "status": "CLOSED",
+                            "current_price": close_price,
+                            "profit": round(profit + swap + commission, 2),
+                            "closed_at": closed_at,
+                            "updated_at": datetime.now(timezone.utc)
+                        })
 
     def handle_execution_event(self, event_data: Dict[str, Any]):
         """
@@ -493,7 +544,8 @@ class CTraderPositionService:
             # Case D: New Position Opened (ORDER_FILLED = 2 / ORDER_PARTIAL_FILL = 8)
             if not existing_post:
                 trade_data = position_trade_data(pos)
-                symbol_id = trade_data.get("symbolId") or pos.get("symbolId") or deal.get("symbolId")
+                raw_symbol_id = trade_data.get("symbolId") or pos.get("symbolId") or deal.get("symbolId")
+                symbol_id = int(raw_symbol_id) if raw_symbol_id is not None else None
                 meta = symbol_registry.resolve(symbol_id=symbol_id, symbol_name=pos.get("symbolName", "XAUUSD"))
                 symbol = meta["name"]
                 

@@ -276,6 +276,7 @@ def format_post(post: Dict[str, Any], current_user_id: Optional[str] = None) -> 
         "trade": {
             "id": post.get("trade_id", f"trade-{post.get('id')}"),
             "cTraderPositionId": post.get("trade_id", "pos-881"),
+            "accountId": post.get("account_id"),
             "userId": post.get("user_id"),
             "symbol": post.get("symbol", "XAUUSD"),
             "direction": post.get("position_type", "BUY"),

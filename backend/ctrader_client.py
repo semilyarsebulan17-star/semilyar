@@ -145,6 +145,13 @@ class CTraderClient:
             "avg_broker_to_socket_latency_ms": 0.0
         }
 
+    @staticmethod
+    def _as_int(value: Any, default: int = 0) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
     def record_latency(self, broker_ts_ms: Optional[int]):
         """Tracks latency from broker event creation to local processing."""
         if not broker_ts_ms:
@@ -717,7 +724,7 @@ class CTraderClient:
 
         # 3. Account Auth Response (2103)
         if payload_type == PROTO_OA_ACCOUNT_AUTH_RES:
-            acct_num = payload_data.get("ctidTraderAccountId", 0)
+            acct_num = self._as_int(payload_data.get("ctidTraderAccountId"))
             logger.info(f"[cTrader.Auth] ProtoOAAccountAuthRes (2103) processed for account: {acct_num}")
             self._handle_account_auth_success(acct_num)
             if acct_num in self._account_auth_futures:
@@ -729,7 +736,7 @@ class CTraderClient:
         # 4. Trader Profile Response (2122)
         if payload_type == PROTO_OA_TRADER_RES:
             trader = payload_data.get("trader", {}) or payload_data
-            acct_num = trader.get("ctidTraderAccountId") or payload_data.get("ctidTraderAccountId", 0)
+            acct_num = self._as_int(trader.get("ctidTraderAccountId") or payload_data.get("ctidTraderAccountId"))
             money_digits = int(trader.get("moneyDigits", 2))
             scale = 10 ** money_digits
             raw_bal = trader.get("balance", 0)
@@ -742,11 +749,10 @@ class CTraderClient:
                 self.account_states[acct_num]["leverage"] = leverage
                 self.account_states[acct_num]["lastTraderUpdateAt"] = now_iso
             logger.info(f"[cTrader.Trader] ProtoOATraderRes (2122) for account {acct_num}: Balance={bal_float}, MoneyDigits={money_digits}, Leverage={leverage}x")
-            return
 
         # 5. Reconcile Response (2125)
         if payload_type == PROTO_OA_RECONCILE_RES:
-            acct_num = payload_data.get("ctidTraderAccountId", 0)
+            acct_num = self._as_int(payload_data.get("ctidTraderAccountId"))
             if acct_num in self.account_states:
                 self.account_states[acct_num]["lastReconciledAt"] = now_iso
             logger.info(f"[cTrader.Reconcile] ProtoOAReconcileRes (2125) received for account {acct_num}")
@@ -755,7 +761,7 @@ class CTraderClient:
         if payload_type == PROTO_OA_ERROR_RES:
             error_code = payload_data.get("errorCode", "UNKNOWN")
             desc = payload_data.get("description", "cTrader Open API Error")
-            acct_num = payload_data.get("ctidTraderAccountId", 0)
+            acct_num = self._as_int(payload_data.get("ctidTraderAccountId"))
             logger.error(f"[cTrader.Error] ProtoOAErrorRes (2142) [{error_code}]: {desc} (Account: {acct_num})")
             if acct_num in self.account_states:
                 self.account_states[acct_num]["authStatus"] = AccountAuthStatus.FAILED.value

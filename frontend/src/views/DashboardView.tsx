@@ -99,7 +99,11 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     fetchConnStatus();
 
     const unsubMetrics = socketClient.onAccountMetrics((metrics) => {
-      setAccountMetrics(metrics);
+      const activeAccountId = currentUser.cTraderAccountId || '';
+      const metricAccountId = metrics.accountId || metrics.ctidTraderAccountId;
+      if (String(metricAccountId) === String(activeAccountId) || String(metricAccountId) === activeAccountId.replace(/^cTrader-/, '')) {
+        setAccountMetrics(metrics);
+      }
     });
 
     const unsubConn = socketClient.onConnectionStatus((status) => {
@@ -128,6 +132,17 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     : [];
 
   const activeAccount = currentAccounts.find((a) => a.accountId === currentUser.cTraderAccountId) || currentAccounts[0];
+
+  const activeAccountPosts = posts.filter((post) => {
+    const postUserId = post.userId || (post as any).user_id || post.trade?.userId;
+    const postAccountId = (post as any).accountId || (post as any).account_id || (post.trade as any)?.accountId;
+    const sameUser = postUserId === currentUser.id || postUserId === currentUser.username;
+    const sameAccount = !activeAccount?.accountId || !postAccountId || postAccountId === activeAccount.accountId;
+    return sameUser && sameAccount;
+  });
+  const activePostTradeIds = new Set(activeAccountPosts.map((post) => post.trade.id));
+  const accountLiveTrades = liveTrades.filter((trade) => activePostTradeIds.has(trade.id));
+  const accountClosedTrades = closedTrades.filter((trade) => activePostTradeIds.has(trade.id));
 
   // Quick switch account
   const handleQuickSwitch = async (acc: typeof currentAccounts[0]) => {
@@ -190,13 +205,13 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   };
 
   // Compute live performance metrics
-  const totalTradesCount = liveTrades.length + closedTrades.length;
-  const winningTrades = closedTrades.filter((t) => (t.profitUSD ?? 0) > 0);
-  const winRate = closedTrades.length > 0 ? (((winningTrades.length / closedTrades.length) * 100) || 0).toFixed(1) : (currentUser.cTraderConnected && currentUser.winRate ? currentUser.winRate.toFixed(1) : '0.0');
-  const closedProfitUSD = closedTrades.reduce((acc, t) => acc + (t.profitUSD ?? 0), 0);
-  const liveProfitUSD = liveTrades.reduce((acc, t) => acc + (t.profitUSD ?? 0), 0);
+  const totalTradesCount = accountLiveTrades.length + accountClosedTrades.length;
+  const winningTrades = accountClosedTrades.filter((t) => (t.profitUSD ?? 0) > 0);
+  const winRate = accountClosedTrades.length > 0 ? (((winningTrades.length / accountClosedTrades.length) * 100) || 0).toFixed(1) : (currentUser.cTraderConnected && currentUser.winRate ? currentUser.winRate.toFixed(1) : '0.0');
+  const closedProfitUSD = accountClosedTrades.reduce((acc, t) => acc + (t.profitUSD ?? 0), 0);
+  const liveProfitUSD = accountLiveTrades.reduce((acc, t) => acc + (t.profitUSD ?? 0), 0);
   const netProfitUSD = +((closedProfitUSD + liveProfitUSD) || 0).toFixed(2);
-  const totalPips = +((closedTrades.reduce((acc, t) => acc + (t.pips ?? 0), 0) + liveTrades.reduce((acc, t) => acc + (t.pips ?? 0), 0)) || 0).toFixed(1);
+  const totalPips = +((accountClosedTrades.reduce((acc, t) => acc + (t.pips ?? 0), 0) + accountLiveTrades.reduce((acc, t) => acc + (t.pips ?? 0), 0)) || 0).toFixed(1);
 
   return (
     <div className="w-full max-w-md mx-auto pb-24 px-3 sm:px-0 space-y-3.5">
@@ -259,8 +274,8 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               : 'text-neutral-400 hover:text-neutral-200'
           }`}
         >
-          <span>Live OP ({liveTrades.length})</span>
-          {liveTrades.length > 0 && (
+          <span>Live OP ({accountLiveTrades.length})</span>
+          {accountLiveTrades.length > 0 && (
             <span className="w-2 h-2 rounded-full bg-emerald-400 inline-block ml-1 animate-pulse" />
           )}
         </button>
@@ -272,7 +287,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               : 'text-neutral-400 hover:text-neutral-200'
           }`}
         >
-          Portofolio ({closedTrades.length})
+          Portofolio ({accountClosedTrades.length})
         </button>
       </div>
 
@@ -314,11 +329,11 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               </div>
               <div className="bg-[#161616] p-2.5 rounded-xl border border-[#222222]">
                 <span className="text-[10px] text-neutral-400 block font-sans">Live Active</span>
-                <span className="text-sm font-bold text-emerald-400">{liveTrades.length} OP</span>
+                <span className="text-sm font-bold text-emerald-400">{accountLiveTrades.length} OP</span>
               </div>
               <div className="bg-[#161616] p-2.5 rounded-xl border border-[#222222]">
                 <span className="text-[10px] text-neutral-400 block font-sans">Win / Loss</span>
-                <span className="text-sm font-bold text-white">{winningTrades.length} / {closedTrades.length - winningTrades.length}</span>
+                <span className="text-sm font-bold text-white">{winningTrades.length} / {accountClosedTrades.length - winningTrades.length}</span>
               </div>
             </div>
           </div>
@@ -536,7 +551,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       {/* Tab 2: Live Positions */}
       {activeTab === 'live' && (
         <div className="space-y-3">
-          {liveTrades.length === 0 ? (
+          {accountLiveTrades.length === 0 ? (
             <div className="text-center py-12 bg-[#111111] rounded-2xl border border-[#1f1f1f] p-5">
               <Activity className="w-8 h-8 text-neutral-600 mx-auto mb-2" />
               <h4 className="text-white font-bold text-xs mb-1">Tidak Ada Posisi Aktif</h4>
@@ -545,7 +560,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               </p>
             </div>
           ) : (
-            liveTrades.map((t) => {
+            accountLiveTrades.map((t) => {
               const strat = getStrategy(t.strategyId);
               const isBuy = t.direction === 'BUY';
               const isProfit = t.profitUSD >= 0;
@@ -603,7 +618,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             <span>Riwayat 20 Trade Terakhir</span>
             <span>Realized P/L</span>
           </div>
-          {closedTrades.map((t) => {
+          {accountClosedTrades.map((t) => {
             const isBuy = t.direction === 'BUY';
             const isProfit = t.profitUSD >= 0;
 

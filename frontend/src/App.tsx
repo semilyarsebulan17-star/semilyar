@@ -361,7 +361,9 @@ export default function App() {
 
     // 4.5 On Account Metrics Update (Realtime Balance & Equity)
     const unsubAccountMetrics = socketClient.onAccountMetrics((metrics) => {
-      if (currentUser && (metrics.accountId === currentUser.cTraderAccountId || metrics.ctidTraderAccountId)) {
+      const activeAccountId = currentUser?.cTraderAccountId || '';
+      const metricAccountId = metrics.accountId || metrics.ctidTraderAccountId;
+      if (currentUser && (String(metricAccountId) === String(activeAccountId) || String(metricAccountId) === activeAccountId.replace(/^cTrader-/, ''))) {
         setCurrentUser((prev) => {
           if (!prev) return null;
           return {
