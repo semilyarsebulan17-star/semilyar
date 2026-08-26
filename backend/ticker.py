@@ -39,7 +39,8 @@ try:
         PROTO_OA_SUBSCRIBE_SPOTS_REQ,
         PROTO_OA_SPOT_EVENT,
         PROTO_OA_EXECUTION_EVENT,
-        PROTO_OA_RECONCILE_RES
+        PROTO_OA_RECONCILE_RES,
+        PROTO_OA_TRADER_RES
     )
 except ImportError:
     from ctrader_client import (
@@ -47,7 +48,8 @@ except ImportError:
         PROTO_OA_SUBSCRIBE_SPOTS_REQ,
         PROTO_OA_SPOT_EVENT,
         PROTO_OA_EXECUTION_EVENT,
-        PROTO_OA_RECONCILE_RES
+        PROTO_OA_RECONCILE_RES,
+        PROTO_OA_TRADER_RES
     )
 
 try:
@@ -152,6 +154,7 @@ class CTraderPositionService:
         ctrader_client.register_handler(PROTO_OA_SPOT_EVENT, self.handle_spot_event)
         ctrader_client.register_handler(PROTO_OA_EXECUTION_EVENT, self.handle_execution_event)
         ctrader_client.register_handler(PROTO_OA_RECONCILE_RES, self.handle_reconcile_event)
+        ctrader_client.register_handler(PROTO_OA_TRADER_RES, self.handle_trader_event)
 
     def set_sio(self, sio_instance):
         self.sio = sio_instance
@@ -315,6 +318,32 @@ class CTraderPositionService:
             })
         except Exception as exc:
             logger.error(f"[cTrader.Reconcile] handle_reconcile_event error: {exc}", exc_info=True)
+
+    def handle_trader_event(self, event_data: Dict[str, Any]):
+        """Persists broker account metrics and publishes the private account snapshot."""
+        try:
+            trader = event_data.get("trader", {}) or event_data
+            acct_num = int(trader.get("ctidTraderAccountId") or event_data.get("ctidTraderAccountId") or 0)
+            if not acct_num:
+                return
+            account_state = ctrader_client.account_states.get(acct_num, {})
+            user_id = ctrader_client.account_to_user_map.get(acct_num) or account_state.get("userId")
+            if user_id:
+                user = db_store.find_user_by_id_or_username(user_id)
+                if user:
+                    accounts = user.get("ctrader_accounts") or []
+                    account_id = f"cTrader-{acct_num}"
+                    for account in accounts:
+                        if account.get("accountId") == account_id:
+                            account["balance"] = account_state.get("balance", account.get("balance", 0.0))
+                            account["leverage"] = account_state.get("leverage", account.get("leverage", 500))
+                            account["currency"] = account_state.get("currency", account.get("currency", "USD"))
+                    db_store.update_user(user.get("id") or user.get("username"), {"ctrader_accounts": accounts})
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    loop.create_task(self.emit_account_update(f"cTrader-{acct_num}"))
+        except Exception as exc:
+            logger.error(f"[cTrader.Trader] handle_trader_event error: {exc}", exc_info=True)
 
     def handle_execution_event(self, event_data: Dict[str, Any]):
         """

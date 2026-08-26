@@ -219,6 +219,15 @@ async def on_startup():
     live_trading_service.start(2.5)
     await ctrader_client.start()
     token_refresh_supervisor.start()
+    # Restore every previously authorized broker account after a process restart.
+    for stored_user in list(db_store.users):
+        if not stored_user.get("ctrader_connected") or not stored_user.get("ctrader_access_token"):
+            continue
+        user_id = stored_user.get("id") or stored_user.get("username")
+        for account in stored_user.get("ctrader_accounts") or []:
+            account_id = account.get("accountId") if isinstance(account, dict) else account
+            if account_id:
+                asyncio.create_task(ctrader_client.authenticate_account(account_id, stored_user["ctrader_access_token"], user_id))
     logger.info(f"[scrolic.backend] Single-runtime FastAPI backend running. Mayar API Key configured: {bool(get_mayar_api_key())}")
 
 @fastapi_app.on_event("shutdown")
@@ -824,7 +833,11 @@ async def ctrader_oauth_callback(request: Request, code: str = Query(""), state:
         user = db_store.find_user_by_id_or_username(user.get("id") or user.get("username"))
 
         # 6. Authenticate account on persistent background client
-        asyncio.create_task(ctrader_client.authenticate_account(primary_acct_id, access_token))
+        asyncio.create_task(ctrader_client.authenticate_account(
+            primary_acct_id,
+            access_token,
+            user.get("id") or user.get("username")
+        ))
 
         user_formatted = format_auth_user_response(user) if user else {}
         user_json_str = json.dumps(user_formatted, default=str)

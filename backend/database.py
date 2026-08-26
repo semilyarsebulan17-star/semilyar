@@ -359,6 +359,9 @@ class MemoryStore:
         return None
 
     # Strategies
+    def find_strategy_by_id(self, strategy_id: str) -> Optional[Dict[str, Any]]:
+        return next((strategy for strategy in self.strategies if strategy.get("id") == strategy_id), None)
+
     def find_all_strategies(self) -> List[Dict[str, Any]]:
         return self.strategies
 
