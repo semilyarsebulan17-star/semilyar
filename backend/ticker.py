@@ -110,6 +110,30 @@ class SymbolRegistry:
 
 symbol_registry = SymbolRegistry()
 
+def normalize_trade_side(value: Any, default: Optional[str] = None) -> Optional[str]:
+    if value is None or value == "":
+        return default
+    normalized = str(value).upper().strip()
+    if normalized in {"BUY", "1", "LONG", "TRADE_SIDE_BUY"}:
+        return "BUY"
+    if normalized in {"SELL", "2", "SHORT", "TRADE_SIDE_SELL"}:
+        return "SELL"
+    return default
+
+def normalize_volume_lots(raw_volume: Any, meta: Dict[str, Any], default: Optional[float] = None) -> Optional[float]:
+    if raw_volume is None or raw_volume == "":
+        return default
+    try:
+        volume = float(raw_volume)
+        lot_units = float(meta.get("lotUnits", 100000.0))
+        return round(volume / lot_units, 2) if lot_units > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+def position_trade_data(position: Dict[str, Any]) -> Dict[str, Any]:
+    trade_data = position.get("tradeData") or position.get("trade_data") or {}
+    return trade_data if isinstance(trade_data, dict) else {}
+
 def calculate_pips(side: str, entry: float, current_bid: float, current_ask: float, pip_size: float) -> float:
     if pip_size <= 0:
         pip_size = 0.0001
@@ -162,11 +186,16 @@ class CTraderPositionService:
     def subscribe_symbol(self, ctid_account_id: int, symbol_id: int):
         """Sends official ProtoOASubscribeSpotsReq (2104)."""
         self.subscribed_symbols.add(symbol_id)
-        asyncio.create_task(ctrader_client.send_message(PROTO_OA_SUBSCRIBE_SPOTS_REQ, {
+        message = {
             "ctidTraderAccountId": ctid_account_id,
             "symbolId": [symbol_id],
             "subscribeToSpotTimestamp": True
-        }))
+        }
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(ctrader_client.send_message(PROTO_OA_SUBSCRIBE_SPOTS_REQ, message))
 
     def handle_spot_event(self, event_data: Dict[str, Any]):
         """
@@ -183,14 +212,14 @@ class CTraderPositionService:
             raw_ask = event_data.get("ask")
             ts = event_data.get("timestamp") or int(time.time() * 1000)
 
-            # Spotware price scaling
+            # ProtoOASpotEvent exposes bid/ask as broker price doubles.
             if raw_bid is not None:
-                bid_val = float(raw_bid) / (10 ** digits) if raw_bid > 10000 else float(raw_bid)
+                bid_val = float(raw_bid)
             else:
                 bid_val = self.market_prices.get(symbol_name, {}).get("bid", 0.0)
 
             if raw_ask is not None:
-                ask_val = float(raw_ask) / (10 ** digits) if raw_ask > 10000 else float(raw_ask)
+                ask_val = float(raw_ask)
             else:
                 ask_val = self.market_prices.get(symbol_name, {}).get("ask", bid_val + (10 ** (-meta["pipPosition"]) * 0.2))
 
@@ -230,7 +259,8 @@ class CTraderPositionService:
             for pos in positions:
                 pos_id = str(pos.get("positionId"))
                 reconciled_position_ids.add(pos_id)
-                symbol_id = pos.get("symbolId")
+                trade_data = position_trade_data(pos)
+                symbol_id = trade_data.get("symbolId") or pos.get("symbolId")
                 meta = symbol_registry.resolve(symbol_id=symbol_id, symbol_name=pos.get("symbolName"))
                 symbol = meta["name"]
                 
@@ -238,11 +268,15 @@ class CTraderPositionService:
                 if symbol_id:
                     self.subscribe_symbol(acct_num, symbol_id)
 
-                side_raw = str(pos.get("tradeSide", "BUY")).upper()
-                trade_side = "BUY" if side_raw in ["BUY", "1", "LONG"] else "SELL"
+                trade_side = normalize_trade_side(trade_data.get("tradeSide") or pos.get("tradeSide"))
+                if not trade_side:
+                    logger.warning(f"[cTrader.Reconcile] Position {pos_id} has no valid tradeSide; skipping")
+                    continue
                 
-                vol_raw = float(pos.get("volume", 100000))
-                lot = round(vol_raw / 100000.0, 2)
+                lot = normalize_volume_lots(trade_data.get("volume") or pos.get("volume"), meta)
+                if lot is None or lot <= 0:
+                    logger.warning(f"[cTrader.Reconcile] Position {pos_id} has no valid volume; skipping")
+                    continue
                 entry = float(pos.get("price") or 0.0)
                 sl = float(pos.get("stopLoss") or 0.0)
                 tp = float(pos.get("takeProfit") or 0.0)
@@ -458,18 +492,23 @@ class CTraderPositionService:
 
             # Case D: New Position Opened (ORDER_FILLED = 2 / ORDER_PARTIAL_FILL = 8)
             if not existing_post:
-                symbol_id = pos.get("symbolId") or deal.get("symbolId")
+                trade_data = position_trade_data(pos)
+                symbol_id = trade_data.get("symbolId") or pos.get("symbolId") or deal.get("symbolId")
                 meta = symbol_registry.resolve(symbol_id=symbol_id, symbol_name=pos.get("symbolName", "XAUUSD"))
                 symbol = meta["name"]
                 
                 if acct_num and symbol_id:
                     self.subscribe_symbol(acct_num, symbol_id)
 
-                side_raw = str(pos.get("tradeSide") or deal.get("tradeSide") or "BUY").upper()
-                trade_side = "BUY" if side_raw in ["BUY", "1", "LONG"] else "SELL"
+                trade_side = normalize_trade_side(trade_data.get("tradeSide") or pos.get("tradeSide") or deal.get("tradeSide"))
+                if not trade_side:
+                    logger.warning(f"[cTrader.Execution] Position {pos_id} has no valid tradeSide; skipping")
+                    return
                 
-                vol_raw = float(pos.get("volume") or deal.get("volume") or 100000)
-                lot = round(vol_raw / 100000.0, 2)
+                lot = normalize_volume_lots(trade_data.get("volume") or pos.get("volume") or deal.get("volume"), meta)
+                if lot is None or lot <= 0:
+                    logger.warning(f"[cTrader.Execution] Position {pos_id} has no valid volume; skipping")
+                    return
                 entry = float(pos.get("price") or deal.get("executionPrice") or 0.0)
                 sl = float(pos.get("stopLoss") or 0.0)
                 tp = float(pos.get("takeProfit") or 0.0)

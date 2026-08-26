@@ -12,7 +12,6 @@ Spec & Official Documentation:
 """
 
 import asyncio
-import json
 import logging
 import ssl
 import struct
@@ -20,6 +19,10 @@ import time
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional, Dict, Any, List, Set, Callable
+
+from google.protobuf.json_format import MessageToDict
+from ctrader_open_api.protobuf import Protobuf
+from ctrader_open_api.messages.OpenApiCommonMessages_pb2 import ProtoMessage, ProtoHeartbeatEvent
 
 from backend.ctrader_config import (
     get_ctrader_client_id,
@@ -57,10 +60,10 @@ PROTO_OA_APPLICATION_AUTH_REQ = 2100
 PROTO_OA_APPLICATION_AUTH_RES = 2101
 PROTO_OA_ACCOUNT_AUTH_REQ = 2102
 PROTO_OA_ACCOUNT_AUTH_RES = 2103
-PROTO_OA_SUBSCRIBE_SPOTS_REQ = 2104
-PROTO_OA_SUBSCRIBE_SPOTS_RES = 2105
-PROTO_OA_UNSUBSCRIBE_SPOTS_REQ = 2106
-PROTO_OA_UNSUBSCRIBE_SPOTS_RES = 2107
+PROTO_OA_SUBSCRIBE_SPOTS_REQ = 2127
+PROTO_OA_SUBSCRIBE_SPOTS_RES = 2128
+PROTO_OA_UNSUBSCRIBE_SPOTS_REQ = 2129
+PROTO_OA_UNSUBSCRIBE_SPOTS_RES = 2130
 PROTO_OA_SPOT_EVENT = 2131
 PROTO_OA_EXECUTION_EVENT = 2126
 PROTO_OA_RECONCILE_REQ = 2124
@@ -68,7 +71,7 @@ PROTO_OA_RECONCILE_RES = 2125
 PROTO_OA_TRADER_REQ = 2121
 PROTO_OA_TRADER_RES = 2122
 PROTO_OA_MARGIN_CHANGED_EVENT = 2156
-PROTO_OA_CLOSE_POSITION_REQ = 2107
+PROTO_OA_CLOSE_POSITION_REQ = 2111
 PROTO_OA_DEAL_LIST_REQ = 2133
 PROTO_OA_DEAL_LIST_RES = 2134
 PROTO_OA_ERROR_RES = 2142
@@ -597,25 +600,27 @@ class CTraderClient:
         asyncio.create_task(self.send_message(PROTO_OA_RECONCILE_REQ, {
             "ctidTraderAccountId": acct_num
         }))
+        asyncio.create_task(self.send_message(PROTO_OA_SUBSCRIBE_SPOTS_REQ, {
+            "ctidTraderAccountId": acct_num,
+            "symbolId": [1, 2, 3, 4, 41, 22396, 22397],
+            "subscribeToSpotTimestamp": True
+        }))
         logger.info(f"[cTrader.Auth] Account {acct_num} AUTHENTICATED. Triggered ProtoOATraderReq (2121) & ProtoOAReconcileReq (2124).")
 
     async def send_message(self, payload_type: int, payload_data: Dict[str, Any]):
-        """Sends a message over the active transport."""
+        """Sends a binary ProtoMessage over the active cTrader transport."""
         now_iso = datetime.now(timezone.utc).isoformat()
         try:
+            message = Protobuf.get(payload_type, **payload_data)
+            envelope = ProtoMessage(
+                payloadType=payload_type,
+                payload=message.SerializeToString()
+            ).SerializeToString()
             if self._transport_type == "TCP_TLS" and self._writer:
-                raw_json = json.dumps(payload_data).encode("utf-8")
-                # 4-byte big endian length prefix for Spotware ProtoMessage
-                header = struct.pack(">I", len(raw_json) + 4)
-                type_hdr = struct.pack(">I", payload_type)
-                self._writer.write(header + type_hdr + raw_json)
+                self._writer.write(struct.pack(">I", len(envelope)) + envelope)
                 await self._writer.drain()
             elif self._transport_type == "WEBSOCKET" and self._ws:
-                msg = {
-                    "payloadType": payload_type,
-                    "payload": payload_data
-                }
-                await self._ws.send(json.dumps(msg))
+                await self._ws.send(envelope)
             
             if payload_type == PROTO_HEARTBEAT_EVENT:
                 self.metrics["last_heartbeat_sent_at"] = now_iso
@@ -647,23 +652,24 @@ class CTraderClient:
         while self._running and self.state in (CTraderConnectionState.CONNECTED, CTraderConnectionState.AUTHENTICATED, CTraderConnectionState.DEGRADED):
             try:
                 if self._transport_type == "TCP_TLS" and self._reader:
-                    # Read 4-byte length prefix
+                    # Read the official Int32 length-prefixed ProtoMessage frame.
                     header_bytes = await self._reader.readexactly(4)
                     msg_len = struct.unpack(">I", header_bytes)[0]
-                    payload_bytes = await self._reader.readexactly(msg_len)
-                    payload_type = struct.unpack(">I", payload_bytes[:4])[0]
-                    body_bytes = payload_bytes[4:]
-                    try:
-                        data = json.loads(body_bytes.decode("utf-8"))
-                    except Exception:
-                        data = {}
-                    await self._handle_incoming_message(payload_type, data)
+                    frame = await self._reader.readexactly(msg_len)
+                    message = ProtoMessage()
+                    message.ParseFromString(frame)
+                    payload = Protobuf.extract(message)
+                    payload_data = MessageToDict(payload, preserving_proto_field_name=False)
+                    await self._handle_incoming_message(message.payloadType, payload_data)
                 elif self._transport_type == "WEBSOCKET" and self._ws:
                     raw_msg = await self._ws.recv()
-                    parsed = json.loads(raw_msg)
-                    payload_type = parsed.get("payloadType", 0)
-                    payload_data = parsed.get("payload", {})
-                    await self._handle_incoming_message(payload_type, payload_data)
+                    if isinstance(raw_msg, str):
+                        raise ValueError("cTrader WebSocket returned non-Protobuf text frame")
+                    message = ProtoMessage()
+                    message.ParseFromString(raw_msg)
+                    payload = Protobuf.extract(message)
+                    payload_data = MessageToDict(payload, preserving_proto_field_name=False)
+                    await self._handle_incoming_message(message.payloadType, payload_data)
                 else:
                     await asyncio.sleep(0.5)
             except asyncio.CancelledError:
